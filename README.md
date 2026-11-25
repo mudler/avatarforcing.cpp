@@ -23,12 +23,16 @@ The model has three parts:
 | M1 | Metadata-driven GGUF converter and round-trip check | done |
 | M2 | C++/ggml flow transformer forward (condition embedder, adaLN tables, 8 blocks, KV caches), parity-gated | done |
 | M3 | Sampler loop: primer, steady blocks, folded KV update, reanchor, CFG, closed-form solver, parity-gated | done |
-| M4+ | Motion decoder, wav2vec2, CLI | not started |
+| M4 | Motion autoencoder: encoder, decoder with grid_sample warping, uint8 conversion, parity-gated | done |
+| M5 | wav2vec2 audio features (raw and normalized input), idle features, audio projection, parity-gated | done |
+| M6 | End-to-end CLI | not started |
 
-The C++ library holds the flow transformer forward pass: the primer shape
-(50 tokens, no cache read) and the steady shape (12 tokens, cache read), with
-the KV cache update, for the two CFG branches, in F32 on the ggml CPU backend.
-`docs/parity.md` gives the parity results against the PyTorch dumps.
+The C++ library holds all three parts in F32 on the ggml CPU backend: the
+flow transformer and its sampler loop (primer and steady blocks, rolling KV
+cache, two-branch CFG), the motion autoencoder, and the wav2vec2 audio
+features. The parity results against the PyTorch dumps are in
+`docs/parity.md` (flow transformer and sampler), `docs/parity-motion.md` and
+`docs/parity-wav2vec2.md`.
 
 ## Build and test
 
@@ -40,17 +44,27 @@ cmake -B build -DGGML_NATIVE=ON
 cmake --build build -j8
 ```
 
-The parity tests need the model GGUF and a baseline GGUF made from the
-reference dumps (see below). Without them they are skipped.
+The parity tests need the model GGUF and baseline GGUFs made from the
+reference dumps (see below). A test whose files are not set is skipped.
 
 ```sh
 python scripts/dumps_to_baseline.py --dumps dumps-gold --nfe 6 \
     --sampler-nfe 6 10 --output flow-baseline.gguf
+python scripts/dumps_to_baseline.py --dumps dumps-gold --nfe 6 \
+    --component motion --output motion-baseline.gguf
+python scripts/dumps_to_baseline.py --dumps dumps-gold --w2v2 \
+    --output w2v2-baseline.gguf
 AVATARFORCING_TEST_GGUF=avatarforcing-f32.gguf \
 AVATARFORCING_TEST_BASELINE=flow-baseline.gguf \
+AVATARFORCING_TEST_MOTION_BASELINE=motion-baseline.gguf \
+AVATARFORCING_TEST_W2V2_BASELINE=w2v2-baseline.gguf \
 AVATARFORCING_TEST_THREADS=8 \
 ctest --test-dir build --output-on-failure
 ```
+
+`test_flow_parity` and `test_sampler_parity` read the flow baseline,
+`test_motion_parity` the motion baseline and `test_wav2vec2_parity` the
+wav2vec2 baseline.
 
 ## Reference tooling
 
