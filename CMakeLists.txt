@@ -24,7 +24,14 @@ add_library(avatarforcing STATIC
     src/backend.cpp
     src/model_loader.cpp
     src/flow.cpp
-    src/sampler.cpp)
+    src/sampler.cpp
+    src/grid_sample.cpp
+    src/motion.cpp)
+# grid_sample.cpp reproduces the rounding of the PyTorch CPU kernel with
+# explicit fmaf calls; motion.cpp builds the base grids like numpy. Neither may
+# get extra fused multiply-adds from the compiler.
+set_source_files_properties(src/grid_sample.cpp src/motion.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
 target_include_directories(avatarforcing PUBLIC src)
 target_link_libraries(avatarforcing PUBLIC ggml)
 

@@ -25,6 +25,15 @@ KV: ``baseline.nfe``, ``baseline.steady0.start_pos`` and, per tag,
 sampler runs: ``baseline.sampler_nfe`` (the list of M), and per M
 ``baseline.sampler<M>.sigma_index`` (i32 array), ``.a_cfg_scale``,
 ``.steady_blocks`` and ``.steady.<b>.start_pos``.
+
+With ``--component motion`` the file holds the motion autoencoder dumps
+instead (for tests/test_motion_parity.cpp):
+
+  enc.<key>               every float array of motion_encoder.npz, except
+                          enc.convs.{0..6}, which are the same arrays as
+                          feat.{6..0}
+  dec.<key>               every float array of decoder_nfe{N}.npz;
+                          dec.frames_u8 is stored as float32
 """
 from __future__ import annotations
 
@@ -38,6 +47,27 @@ AUDIO_KEYS = ("stacked", "proj.linear", "proj.norm", "features")
 TAGS = ("primer_step0", "primer_kvupdate", "steady0_step0", "steady0_final")
 
 
+def write_motion(args, load, add):
+    z = load("motion_encoder.npz")
+    n_res = sum(1 for k in z.files if k.startswith("enc.convs."))
+    n_feat = sum(1 for k in z.files if k.startswith("feat."))
+    dup = {f"enc.convs.{n_res - 3 - l}" for l in range(n_feat)}   # feat.l = res[::-1][2:][l]
+    for k in z.files:
+        if k in dup:
+            continue
+        if z[k].dtype != np.float32:
+            sys.exit(f"unexpected dtype {z[k].dtype} for {k}")
+        add(f"enc.{k}", z[k])
+    z = load(f"decoder_nfe{args.nfe}.npz")
+    for k in z.files:
+        a = z[k]
+        if k == "frames_u8":
+            a = a.astype(np.float32)
+        elif a.dtype != np.float32:
+            sys.exit(f"unexpected dtype {a.dtype} for {k}")
+        add(f"dec.{k}", a)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dumps", required=True, help="directory written by dump_reference.py")
@@ -45,6 +75,8 @@ def main():
     ap.add_argument("--sampler-nfe", type=int, nargs="*", default=[6, 10],
                     help="nfe of the sampler runs to include (default 6 10; none: skip)")
     ap.add_argument("--output", required=True, help="baseline GGUF to write")
+    ap.add_argument("--component", choices=("flow", "motion"), default="flow",
+                    help="flow transformer (default) or motion autoencoder dumps")
     args = ap.parse_args()
 
     import gguf
@@ -69,6 +101,15 @@ def main():
             arr = arr.reshape((-1,) + arr.shape[-3:])
         w.add_tensor(name, arr)
         n += 1
+
+    if args.component == "motion":
+        write_motion(args, load, add)
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        print(f"wrote {args.output}: {n} tensors")
+        return
 
     z = load(f"adaln_nfe{args.nfe}.npz")
     for k in z.files:
