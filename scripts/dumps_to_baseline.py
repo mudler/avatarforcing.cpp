@@ -20,6 +20,17 @@ dim]) have their leading dimensions merged: ggml tensors have at most 4.
 
 KV: ``baseline.nfe``, ``baseline.steady0.start_pos`` and, per tag,
 ``baseline.<tag>.update_kv_cache`` and ``baseline.<tag>.kv_read``.
+
+With ``--w2v2`` the script writes the wav2vec2 baseline instead (a separate
+file, so the flow test does not load it):
+
+  raw.<key>, normalized.<key>  pcm_in, model_input, conv.0, conv.6, interp,
+                               feature_projection(.norm), pos_conv,
+                               hidden.0 .. hidden.12, stacked, proj.linear,
+                               proj.norm, features of wav2vec_<mode>.npz
+  idle.pcm, idle.features      idle_pink.npz
+
+KV: ``baseline.<mode>.n_frames``.
 """
 from __future__ import annotations
 
@@ -30,6 +41,9 @@ import sys
 import numpy as np
 
 AUDIO_KEYS = ("stacked", "proj.linear", "proj.norm", "features")
+W2V2_KEYS = ("pcm_in", "model_input", "conv.0", "conv.6", "interp", "feature_projection",
+             "feature_projection.norm", "pos_conv") + tuple(f"hidden.{i}" for i in range(13)) + \
+            ("stacked", "proj.linear", "proj.norm", "features")
 TAGS = ("primer_step0", "primer_kvupdate", "steady0_step0", "steady0_final")
 
 
@@ -38,6 +52,7 @@ def main():
     ap.add_argument("--dumps", required=True, help="directory written by dump_reference.py")
     ap.add_argument("--nfe", type=int, default=6, help="nfe of the detail run (default 6)")
     ap.add_argument("--output", required=True, help="baseline GGUF to write")
+    ap.add_argument("--w2v2", action="store_true", help="write the wav2vec2 baseline instead")
     args = ap.parse_args()
 
     import gguf
@@ -62,6 +77,22 @@ def main():
             arr = arr.reshape((-1,) + arr.shape[-3:])
         w.add_tensor(name, arr)
         n += 1
+
+    if args.w2v2:
+        for mode in ("raw", "normalized"):
+            z = load(f"wav2vec_{mode}.npz")
+            w.add_uint32(f"baseline.{mode}.n_frames", int(z["n_frames"]))
+            for k in W2V2_KEYS:
+                add(f"{mode}.{k}", z[k])
+        z = load("idle_pink.npz")
+        add("idle.pcm", z["pcm"])
+        add("idle.features", z["features"])
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        print(f"wrote {args.output}: {n} tensors")
+        return
 
     z = load(f"adaln_nfe{args.nfe}.npz")
     for k in z.files:
