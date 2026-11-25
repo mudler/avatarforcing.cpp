@@ -15,10 +15,9 @@ namespace af {
 //         channel-planar form of the [B, H, W, 2] grid that PyTorch takes.
 //   result: [W, H, C, B] F32.
 //
-// ggml has no grid_sample operator. This is a CPU custom op
-// (ggml_custom_4d), so the graph that uses it must run on the CPU backend.
-// A GPU backend needs its own kernel with the same arithmetic (see
-// grid_sample.cpp for the exact rounding).
+// This is GGML_OP_GRID_SAMPLE, an operator that patches/ adds to the
+// vendored ggml, with a CPU and a CUDA kernel of the same arithmetic (the
+// results are bit-identical; see grid_sample.cpp for the exact rounding).
 ggml_tensor* grid_sample_bilinear_zeros(ggml_context* ctx, ggml_tensor* feat, ggml_tensor* grid);
 
 // Host reference of the same computation, for tests. Same layouts as above.
