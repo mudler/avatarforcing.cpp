@@ -23,7 +23,12 @@ add_subdirectory(third_party/ggml)
 add_library(avatarforcing STATIC
     src/backend.cpp
     src/model_loader.cpp
-    src/flow.cpp)
+    src/flow.cpp
+    src/grid_sample.cpp)
+# grid_sample.cpp reproduces the rounding of the PyTorch CPU kernel with
+# explicit fmaf calls. The compiler must not add other fused multiply-adds.
+set_source_files_properties(src/grid_sample.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
 target_include_directories(avatarforcing PUBLIC src)
 target_link_libraries(avatarforcing PUBLIC ggml)
 
