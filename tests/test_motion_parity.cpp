@@ -5,8 +5,10 @@
 //   AVATARFORCING_TEST_MOTION_BASELINE  baseline GGUF
 //                                       (scripts/dumps_to_baseline.py --component motion)
 //   AVATARFORCING_TEST_THREADS          CPU threads (default 8)
+//   AVATARFORCING_TEST_BACKEND          cpu (default) or cuda
 //   AVATARFORCING_TEST_CHUNK            frames per decoder graph (default 1, 0 = whole block)
 //   AVATARFORCING_TEST_RUNS             timing runs, the fastest is reported (default 1)
+//   AVATARFORCING_TEST_DUMP_DIR         writes the frame-0 decoder taps there as raw float32
 // Exits 77 (skip) when a path is unset or missing.
 //
 // Gates:
@@ -25,6 +27,7 @@
 #include "motion.hpp"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <sys/resource.h>
@@ -208,7 +211,9 @@ int main() {
     const char* rn = std::getenv("AVATARFORCING_TEST_RUNS");
     const int runs = std::max(1, rn ? std::atoi(rn) : 1);
 
-    af::Backend backend(n_threads);
+    af::Backend backend(n_threads, af::Backend::device_from_env("AVATARFORCING_TEST_BACKEND"));
+    if (!backend.ok()) return 1;
+    std::fprintf(stderr, "backend: %s\n", backend.device().c_str());
     af::MotionModel model(backend);
     auto t_load = std::chrono::steady_clock::now();
     if (!model.load(gguf_path)) { std::fprintf(stderr, "model load failed\n"); return 1; }
@@ -262,6 +267,19 @@ int main() {
         if (!model.set_portrait(ref)) return 1;
         af::MotionTaps taps;
         if (!model.decode(latent.data(), 1, pixels, &taps)) return 1;   // frame 0 with taps
+        if (const char* dd = std::getenv("AVATARFORCING_TEST_DUMP_DIR")) {
+            // Raw float32 files of every frame-0 tap and the pixels, for
+            // offline comparison (e.g. with a float64 run of the reference).
+            taps["pixels"] = pixels;
+            for (const auto& kv : taps) {
+                const std::string path = std::string(dd) + "/" + kv.first + ".f32";
+                if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(kv.second.data(), sizeof(float), kv.second.size(), f);
+                    std::fclose(f);
+                }
+            }
+            taps.erase("pixels");
+        }
         check("decoder.const", taps["const"], bl.vec("dec.const"), false);
         check("decoder.conv1.style", taps["conv1.style"], bl.vec("dec.conv1.style"), false);
         check("decoder.conv1", taps["conv1"], bl.vec("dec.conv1"), false);
@@ -317,6 +335,40 @@ int main() {
         std::vector<float> grid(2 * hw), out(feat.size());
         for (size_t i = 0; i < hw; ++i) { grid[i] = flow[2 * i]; grid[hw + i] = flow[2 * i + 1]; }
         af::grid_sample_bilinear_zeros_host(feat.data(), n, n, c, 1, grid.data(), n, n, 1, out.data());
+        {
+            // The ggml operator on the test backend must give the same bits
+            // as the host reference. Two grids (the reference one and a
+            // shifted copy that samples outside the map) against one shared
+            // feature map, which also covers the batch broadcast.
+            std::vector<float> grid2(4 * hw), op_out;
+            for (size_t i = 0; i < 2 * hw; ++i) { grid2[i] = grid[i]; grid2[2 * hw + i] = grid[i] * 1.37f + 0.11f; }
+            std::vector<float> host2(2 * feat.size());
+            af::grid_sample_bilinear_zeros_host(feat.data(), n, n, c, 1, grid2.data(), n, n, 2, host2.data());
+            ggml_tensor* res = nullptr;
+            const bool ok = backend.compute(
+                [&](af::Backend::Graph& g) {
+                    ggml_tensor* f = g.input(feat.data(), n, n, c, 1);
+                    ggml_tensor* gr = g.input(grid2.data(), n, n, 2, 2);
+                    res = af::grid_sample_bilinear_zeros(g.ctx, f, gr);
+                    ggml_set_output(res);
+                    ggml_build_forward_expand(g.gf, res);
+                    return true;
+                },
+                [&](af::Backend::Graph&) {
+                    op_out.resize(ggml_nelements(res));
+                    ggml_backend_tensor_get(res, op_out.data(), 0, ggml_nbytes(res));
+                });
+            size_t n_diff = 0;
+            double md = 0;
+            if (ok)
+                for (size_t i = 0; i < host2.size(); ++i)
+                    if (std::memcmp(&op_out[i], &host2[i], sizeof(float)) != 0) {
+                        ++n_diff;
+                        md = std::max(md, (double)std::fabs(op_out[i] - host2[i]));
+                    }
+            g_rows.push_back({"grid_sample." + p + "op_vs_host (differing values: " + std::to_string(n_diff) + ")",
+                              md, 0.0, "bit-exact", ok && n_diff == 0});
+        }
         for (int ch = 0; ch < c; ++ch)
             for (size_t i = 0; i < hw; ++i)
                 out[ch * hw + i] *= 1.0f / (1.0f + std::exp(-raw[2 * hw + i]));

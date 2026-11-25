@@ -4,6 +4,7 @@
 //   AVATARFORCING_TEST_GGUF      model GGUF (convert_avatarforcing_to_gguf.py)
 //   AVATARFORCING_TEST_BASELINE  baseline GGUF (scripts/dumps_to_baseline.py)
 //   AVATARFORCING_TEST_THREADS   CPU threads (default 8)
+//   AVATARFORCING_TEST_BACKEND   cpu (default) or cuda
 // Exits 77 (skip) when a path is unset or missing.
 //
 // Metric per module: max_abs = max |got - ref|, max_rel = max_abs / max |ref|.
@@ -157,7 +158,9 @@ int main() {
     const char* th = std::getenv("AVATARFORCING_TEST_THREADS");
     const int n_threads = th ? std::atoi(th) : 8;
 
-    af::Backend be(n_threads);
+    af::Backend be(n_threads, af::Backend::device_from_env("AVATARFORCING_TEST_BACKEND"));
+    if (!be.ok()) return 1;
+    std::fprintf(stderr, "backend: %s\n", be.device().c_str());
     af::FlowModel model(be);
     auto t_load = std::chrono::steady_clock::now();
     if (!model.load(gguf_path)) { std::fprintf(stderr, "model load failed\n"); return 1; }

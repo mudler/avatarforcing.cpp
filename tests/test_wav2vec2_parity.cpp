@@ -5,6 +5,7 @@
 //   AVATARFORCING_TEST_W2V2_BASELINE   wav2vec2 baseline GGUF
 //                                      (scripts/dumps_to_baseline.py --w2v2)
 //   AVATARFORCING_TEST_THREADS         CPU threads (default 8)
+//   AVATARFORCING_TEST_BACKEND         cpu (default) or cuda
 //   AVATARFORCING_TEST_LONG_SECONDS    length of the long-phrase run (default 30, 0 = off)
 // Exits 77 (skip) when a path is unset or missing.
 //
@@ -116,7 +117,9 @@ int main() {
     Baseline bl;
     if (!bl.open(bl_path)) { std::fprintf(stderr, "cannot open baseline %s\n", bl_path); return 1; }
 
-    af::Backend backend(n_threads);
+    af::Backend backend(n_threads, af::Backend::device_from_env("AVATARFORCING_TEST_BACKEND"));
+    if (!backend.ok()) return 1;
+    std::fprintf(stderr, "backend: %s\n", backend.device().c_str());
     af::FlowModel flow(backend);
     if (!flow.load(gguf_path)) { std::fprintf(stderr, "flow load failed\n"); return 1; }
     af::AudioEncoder enc(backend, flow);
