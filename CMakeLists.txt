@@ -19,6 +19,7 @@ endif()
 add_subdirectory(third_party/ggml)
 
 add_library(avatarforcing STATIC
-    src/backend.cpp)
+    src/backend.cpp
+    src/model_loader.cpp)
 target_include_directories(avatarforcing PUBLIC src)
 target_link_libraries(avatarforcing PUBLIC ggml)
