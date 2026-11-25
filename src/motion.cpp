@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 // Motion autoencoder graph (LIA / StyleGAN2 style), ggml layout [W, H, C, B].
@@ -155,11 +156,15 @@ bool MotionModel::read_config(const std::string& path) {
     check(c.pad_dec_upsample[0] + c.pad_dec_upsample[1] == kb - 1, "pad.dec_upsample");
     check(c.grid_sample == "bilinear, zeros, align_corners=false", "grid_sample mode");
     check(c.block_frames > 0, "block_frames");
+    check(c.act_gain > 0.f, "act_gain must be positive (folded into the demodulation)");
     return ok;
 }
 
 bool MotionModel::load(const std::string& gguf_path) {
     if (!read_config(gguf_path)) return false;
+    // Convolution path (see conv2d()).
+    const char* cm = std::getenv("AVATARFORCING_CONV");
+    im2col_ = cm && std::strcmp(cm, "im2col") == 0;
     if (!loader_.load(gguf_path, be_.handle(), {"mae."})) return false;
     const int L = (int)cfg_.dec_n_levels;
 
@@ -226,7 +231,7 @@ bool MotionModel::build_derived() {
     for (uint32_t c : cfg_.enc_channels) cmax = std::max(cmax, c);
     for (uint32_t c : cfg_.dec_channels) cmax = std::max(cmax, c);
 
-    ggml_init_params p = { ggml_tensor_overhead() * (4 * L + L + 8), nullptr, true };
+    ggml_init_params p = { ggml_tensor_overhead() * (4 * L + L + 2 * L + 1 + 8), nullptr, true };
     dctx_ = ggml_init(p);
     blur_down_ = ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, kb, kb, 1, cmax);
     blur_up_ = ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, kb, kb, 1, cmax);
@@ -240,6 +245,9 @@ bool MotionModel::build_derived() {
         const int n = 8 << l;
         grids_.push_back(ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, n, n, 2, 1));
     }
+    std::vector<StyledConv*> styled_all = {&conv1_};
+    for (StyledConv& c : convs_) styled_all.push_back(&c);
+    for (StyledConv* c : styled_all) c->gbias = ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, 1, 1, c->act_b->ne[0], 1);
     dbuf_ = ggml_backend_alloc_ctx_tensors(dctx_, be_.handle());
     if (!dbuf_) { AF_LOG("motion: derived buffer allocation failed"); return false; }
 
@@ -287,6 +295,15 @@ bool MotionModel::build_derived() {
             }
     }
 
+    // act_gain * activation bias, float32 (as ggml_scale computes it), shaped
+    // [1, 1, C, 1]: a leaf of the graph, so that the MUL, ADD and LEAKY_RELU
+    // nodes of a StyledConv are consecutive and the CUDA backend fuses them.
+    for (StyledConv* c : styled_all) {
+        std::vector<float> b = get_host(c->act_b);
+        for (float& v : b) v = v * cfg_.act_gain;
+        ggml_backend_tensor_set(c->gbias, b.data(), 0, ggml_nbytes(c->gbias));
+    }
+
     // Base grids: numpy linspace(-1, 1, n) in float64, cast to float32;
     // plane 0 varies along W (x), plane 1 along H (y).
     for (int l = 0; l < L; ++l) {
@@ -310,6 +327,21 @@ bool MotionModel::build_derived() {
     return true;
 }
 
+// Dense 2-D convolution: ggml_conv_2d_direct (no im2col buffer; on CUDA the
+// patched ggml runs it as an implicit GEMM). AVATARFORCING_CONV=im2col
+// switches to F32 im2col and one GEMM per frame, for comparison.
+// w [KW, KH, IC, OC], x [W, H, IC, N] -> [OW, OH, OC, N].
+ggml_tensor* MotionModel::conv2d(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, int s0, int s1, int p0, int p1,
+                                 int d0, int d1) const {
+    if (!im2col_) return ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
+    ggml_tensor* im = ggml_im2col(ctx, w, x, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F32);   // [K, OW, OH, N]
+    const int64_t K = im->ne[0], OW = im->ne[1], OH = im->ne[2], N = im->ne[3], OC = w->ne[3];
+    ggml_tensor* k = ggml_reshape_3d(ctx, w, K, OC, 1);
+    if (N > 1) k = ggml_repeat(ctx, k, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, OC, N));
+    ggml_tensor* y = ggml_mul_mat(ctx, ggml_reshape_3d(ctx, im, K, OW * OH, N), k);          // [OW*OH, OC, N]
+    return ggml_reshape_4d(ctx, y, OW, OH, OC, N);
+}
+
 // FusedLeakyReLU: leaky_relu(x + bias, slope) * gain.
 ggml_tensor* MotionModel::lrelu_bias(ggml_context* ctx, ggml_tensor* x, ggml_tensor* bias) const {
     x = ggml_add(ctx, x, ggml_reshape_4d(ctx, bias, 1, 1, bias->ne[0], 1));
@@ -327,13 +359,17 @@ ggml_tensor* MotionModel::blur(ggml_context* ctx, ggml_tensor* x, ggml_tensor* k
 }
 
 // upfirdn2d with up = 2 (the Upsample module of ToRGB and ToFlow).
+// The reshapes keep every outer dimension in ne[2] (ne[3] = 1): the CUDA
+// concat launches one kernel per ne[3] slice, and a pad of a 1-wide row
+// would leave most threads of a block idle.
 ggml_tensor* MotionModel::upsample(ggml_context* ctx, ggml_tensor* x) const {
     const int64_t w = x->ne[0], h = x->ne[1], c = x->ne[2], b = x->ne[3];
-    // zero insertion: x[i] -> position 2i, zeros at 2i + 1
-    ggml_tensor* t = ggml_reshape_4d(ctx, x, 1, w, h, c * b);
-    t = ggml_pad(ctx, t, 1, 0, 0, 0);
-    t = ggml_reshape_4d(ctx, t, 2 * w, 1, h, c * b);
-    t = ggml_pad(ctx, t, 0, 1, 0, 0);
+    // zero insertion: x[i] -> position 2i, zeros at 2i + 1 (x * 0 is 0: the
+    // flow and the image are finite)
+    ggml_tensor* t = ggml_reshape_3d(ctx, x, 1, w, h * c * b);
+    t = ggml_concat(ctx, t, ggml_scale(ctx, t, 0.0f), 0);              // [2, w, h*c*b]
+    t = ggml_reshape_3d(ctx, t, 2 * w, 1, h * c * b);
+    t = ggml_concat(ctx, t, ggml_scale(ctx, t, 0.0f), 1);              // [2w, 2, h*c*b]
     t = ggml_reshape_4d(ctx, t, 2 * w, 2 * h, c, b);
     const int p0 = cfg_.pad_dec_upsample[0], p1 = cfg_.pad_dec_upsample[1];
     t = ggml_pad_ext(ctx, t, p0, p1, p0, p1, 0, 0, 0, 0);
@@ -355,32 +391,37 @@ ggml_tensor* MotionModel::styled_conv(ggml_context* ctx, ggml_tensor* x, ggml_te
     ggml_tensor* y;
     if (!up) {
         const int pad = (int)(c.w->ne[0] / 2);
-        y = ggml_conv_2d_direct(ctx, c.w, xs, 1, 1, pad, pad, 1, 1);
+        y = conv2d(ctx, c.w, xs, 1, 1, pad, pad, 1, 1);
     } else {
         // Transposed conv by output phase, each phase padded to H + 1.
         ggml_tensor* ph[2][2];
         for (int ey = 0; ey < 2; ++ey)
             for (int ex = 0; ex < 2; ++ex) {
-                ggml_tensor* p = ggml_conv_2d_direct(ctx, c.phase[ey][ex], xs, 1, 1, ex == 0 ? 1 : 0,
+                ggml_tensor* p = conv2d(ctx, c.phase[ey][ex], xs, 1, 1, ex == 0 ? 1 : 0,
                                                      ey == 0 ? 1 : 0, 1, 1);
                 if (ex == 1 || ey == 1) p = ggml_pad(ctx, p, ex, ey, 0, 0);
                 ph[ey][ex] = p;
             }
+        // Interleave in 3-D shapes (ne[3] = 1), see upsample().
         const int64_t hp = ph[0][0]->ne[1], wp = ph[0][0]->ne[0];
         ggml_tensor* rows[2];
         for (int ey = 0; ey < 2; ++ey) {
-            ggml_tensor* a = ggml_reshape_4d(ctx, ph[ey][0], 1, wp, hp, co * B);
-            ggml_tensor* b = ggml_reshape_4d(ctx, ph[ey][1], 1, wp, hp, co * B);
-            ggml_tensor* r = ggml_concat(ctx, a, b, 0);                  // [2, wp, hp, co*B]
-            rows[ey] = ggml_reshape_4d(ctx, r, 2 * wp, 1, hp, co * B);
+            ggml_tensor* a = ggml_reshape_3d(ctx, ph[ey][0], 1, wp, hp * co * B);
+            ggml_tensor* b = ggml_reshape_3d(ctx, ph[ey][1], 1, wp, hp * co * B);
+            ggml_tensor* r = ggml_concat(ctx, a, b, 0);                  // [2, wp, hp*co*B]
+            rows[ey] = ggml_reshape_3d(ctx, r, 2 * wp, 1, hp * co * B);
         }
-        y = ggml_concat(ctx, rows[0], rows[1], 1);                       // [2wp, 2, hp, co*B]
+        y = ggml_concat(ctx, rows[0], rows[1], 1);                       // [2wp, 2, hp*co*B]
         y = ggml_reshape_4d(ctx, y, 2 * wp, 2 * hp, co, B);              // 2H+1 data + one zero row/col
     }
-    // demod[o, b] = 1 / sqrt(sum_i s[i, b]^2 * wsq[o, i] + eps)
+    // demod[o, b] = 1 / sqrt(sum_i s[i, b]^2 * wsq[o, i] + eps). The
+    // activation gain g > 0 of FusedLeakyReLU is folded in:
+    // leaky(y * demod + bias) * g = leaky(y * (g * demod) + g * bias), which
+    // saves one pass over the full-resolution tensor.
     ggml_tensor* d = ggml_mul_mat(ctx, c.wsq, ggml_sqr(ctx, s));                  // [co, B]
     d = ggml_sqrt(ctx, ggml_scale_bias(ctx, d, 1.0f, cfg_.demod_eps));
-    y = ggml_div(ctx, y, ggml_reshape_4d(ctx, d, 1, 1, co, B));
+    ggml_tensor* gd = ggml_div(ctx, ggml_scale_bias(ctx, d, 0.0f, cfg_.act_gain), d);   // g / d
+    y = ggml_mul(ctx, y, ggml_reshape_4d(ctx, gd, 1, 1, co, B));
     if (up) {
         // Blur with padding (p0, p1) of the 2H+1 output; the trailing zero row
         // and column of the phase layout already provide one unit of p1.
@@ -388,7 +429,8 @@ ggml_tensor* MotionModel::styled_conv(ggml_context* ctx, ggml_tensor* x, ggml_te
         y = ggml_pad_ext(ctx, y, p0, p1, p0, p1, 0, 0, 0, 0);
         y = blur(ctx, y, blur_up_, 0);
     }
-    return lrelu_bias(ctx, y, c.act_b);
+    y = ggml_add(ctx, y, c.gbias);
+    return ggml_leaky_relu(ctx, y, cfg_.leaky_slope, false);
 }
 
 bool MotionModel::encode(const float* image, Portrait& out, MotionTaps* taps) {
@@ -400,30 +442,30 @@ bool MotionModel::encode(const float* image, Portrait& out, MotionTaps* taps) {
     auto build = [&](Backend::Graph& g) {
         ggml_context* ctx = g.ctx;
         ggml_tensor* x = g.input(image, S, S, 3, 1);
-        ggml_tensor* h = ggml_conv_2d_direct(ctx, enc_in_w_, x, 1, 1, 0, 0, 1, 1);
+        ggml_tensor* h = conv2d(ctx, enc_in_w_, x, 1, 1, 0, 0, 1, 1);
         h = lrelu_bias(ctx, h, enc_in_b_);
         res.push_back(h);
         for (const ResBlock& b : res_) {
             const int pad1 = (int)(b.c1_w->ne[0] / 2);
-            ggml_tensor* a = ggml_conv_2d_direct(ctx, b.c1_w, h, 1, 1, pad1, pad1, 1, 1);
+            ggml_tensor* a = conv2d(ctx, b.c1_w, h, 1, 1, pad1, pad1, 1, 1);
             a = lrelu_bias(ctx, a, b.c1_b);
             const int pc = cfg_.pad_enc_down_conv3[0], ps = cfg_.pad_enc_down_skip1[0];
             if (cfg_.pad_enc_down_conv3[0] != cfg_.pad_enc_down_conv3[1])
                 a = blur(ctx, ggml_pad_ext(ctx, a, pc, cfg_.pad_enc_down_conv3[1], pc, cfg_.pad_enc_down_conv3[1], 0, 0, 0, 0), blur_down_, 0);
             else
                 a = blur(ctx, a, blur_down_, pc);
-            a = ggml_conv_2d_direct(ctx, b.c2_w, a, 2, 2, 0, 0, 1, 1);
+            a = conv2d(ctx, b.c2_w, a, 2, 2, 0, 0, 1, 1);
             a = lrelu_bias(ctx, a, b.c2_b);
             ggml_tensor* sk;
             if (cfg_.pad_enc_down_skip1[0] != cfg_.pad_enc_down_skip1[1])
                 sk = blur(ctx, ggml_pad_ext(ctx, h, ps, cfg_.pad_enc_down_skip1[1], ps, cfg_.pad_enc_down_skip1[1], 0, 0, 0, 0), blur_down_, 0);
             else
                 sk = blur(ctx, h, blur_down_, ps);
-            sk = ggml_conv_2d_direct(ctx, b.skip_w, sk, 2, 2, 0, 0, 1, 1);
+            sk = conv2d(ctx, b.skip_w, sk, 2, 2, 0, 0, 1, 1);
             h = ggml_scale(ctx, ggml_add(ctx, a, sk), cfg_.resblock_scale);
             res.push_back(h);
         }
-        h = ggml_conv_2d_direct(ctx, enc_out_w_, h, 1, 1, 0, 0, 1, 1);   // [1, 1, style_dim, 1]
+        h = conv2d(ctx, enc_out_w_, h, 1, 1, 0, 0, 1, 1);   // [1, 1, style_dim, 1]
         res.push_back(h);
         sr = ggml_reshape_2d(ctx, h, cfg_.style_dim, 1);
         ggml_tensor* v = sr;
@@ -527,7 +569,7 @@ bool MotionModel::decode_styles(const float* style, int n, std::vector<float>& p
                 const int64_t C = x->ne[2], H = x->ne[1], W = x->ne[0];
                 s = ggml_add(ctx, ggml_mul_mat(ctx, tf.mod_w, st), tf.mod_b);
                 tap(p + "toflow.style", s);
-                ggml_tensor* fr = ggml_conv_2d_direct(ctx, tf.w, ggml_mul(ctx, x, ggml_reshape_4d(ctx, s, 1, 1, C, B)),
+                ggml_tensor* fr = conv2d(ctx, tf.w, ggml_mul(ctx, x, ggml_reshape_4d(ctx, s, 1, 1, C, B)),
                                                       1, 1, 0, 0, 1, 1);
                 fr = ggml_add(ctx, fr, ggml_reshape_4d(ctx, tf.b, 1, 1, tf.b->ne[0], 1));
                 if (flow_raw) fr = ggml_add(ctx, fr, upsample(ctx, flow_raw));
@@ -546,7 +588,7 @@ bool MotionModel::decode_styles(const float* style, int n, std::vector<float>& p
 
                 // ToRGB (not modulated): 1x1 conv, FusedLeakyReLU, + bias, + up(skip)
                 const ToRGB& tr = to_rgbs_[l];
-                ggml_tensor* r = lrelu_bias(ctx, ggml_conv_2d_direct(ctx, tr.w, warp, 1, 1, 0, 0, 1, 1), tr.act_b);
+                ggml_tensor* r = lrelu_bias(ctx, conv2d(ctx, tr.w, warp, 1, 1, 0, 0, 1, 1), tr.act_b);
                 r = ggml_add(ctx, r, ggml_reshape_4d(ctx, tr.b, 1, 1, tr.b->ne[0], 1));
                 if (skip) r = ggml_add(ctx, r, upsample(ctx, skip));
                 skip = r;

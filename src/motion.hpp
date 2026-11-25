@@ -47,8 +47,8 @@ struct Portrait {
 };
 
 // Motion autoencoder: encoder (once per portrait) and decoder (per frame).
-// All arithmetic runs in F32 on the ggml CPU backend. grid_sample is a CPU
-// custom op (grid_sample.hpp).
+// All arithmetic runs in F32, on the CPU or a GPU backend. grid_sample is
+// GGML_OP_GRID_SAMPLE of the patched ggml (grid_sample.hpp).
 class MotionModel {
 public:
     explicit MotionModel(Backend& backend) : be_(backend) {}
@@ -89,6 +89,7 @@ public:
 private:
     struct StyledConv {
         ggml_tensor *w, *wsq, *mod_w, *mod_b, *act_b;
+        ggml_tensor* gbias = nullptr;   // act_gain * act_b as [1, 1, C, 1] (derived)
         ggml_tensor* phase[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};  // transposed conv only
     };
     struct ToFlow { ggml_tensor *w, *mod_w, *mod_b, *b; };
@@ -97,6 +98,8 @@ private:
 
     bool read_config(const std::string& path);
     bool build_derived();
+    ggml_tensor* conv2d(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, int s0, int s1, int p0, int p1,
+                        int d0, int d1) const;
     ggml_tensor* lrelu_bias(ggml_context* ctx, ggml_tensor* x, ggml_tensor* bias) const;
     ggml_tensor* blur(ggml_context* ctx, ggml_tensor* x, ggml_tensor* kernel, int pad) const;
     ggml_tensor* upsample(ggml_context* ctx, ggml_tensor* x) const;
@@ -107,6 +110,7 @@ private:
     ModelLoader loader_;
     MaeConfig cfg_;
     int chunk_frames_ = 1;
+    bool im2col_ = false;   // conv path, see conv2d()
 
     // encoder
     ggml_tensor *enc_in_w_ = nullptr, *enc_in_b_ = nullptr, *enc_out_w_ = nullptr, *q_ = nullptr;
