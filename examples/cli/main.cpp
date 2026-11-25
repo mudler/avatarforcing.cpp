@@ -14,6 +14,7 @@
 #include "wav2vec2.hpp"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -25,6 +26,7 @@
 #include "stb_image_write.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -33,10 +35,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -62,6 +70,10 @@ struct Args {
     bool normalized = true;
     int threads = 0;
     int max_seconds = 30;
+    std::string backend = "cpu";
+    int decode_batch = -1;     // < 0: 1 on the CPU, a whole block elsewhere
+    bool profile = false;
+    int overlap = -1;          // < 0: on for a GPU backend, off on the CPU
 };
 
 void usage(const char* prog) {
@@ -88,7 +100,16 @@ void usage(const char* prog) {
         "  --audio-mode M        normalized (default, offline path) or raw (live app)\n"
         "  --max-seconds N       keep the first N s of audio (default 30, as upstream;\n"
         "                        0: no limit)\n"
-        "  --threads N           CPU threads (default: all cores)\n",
+        "  --threads N           CPU threads (default: all cores)\n"
+        "  --backend B           compute device: cpu (default), cuda, cuda:N; --device is\n"
+        "                        an alias\n"
+        "  --decode-batch N      frames per decoder graph (default: 1 on the CPU, a whole\n"
+        "                        block of 10 on a GPU)\n"
+        "  --profile             print a per-op time profile of the decoder (runs the\n"
+        "                        graphs node by node; slow)\n"
+        "  --overlap, --no-overlap\n"
+        "                        decode block N while the sampler computes block N + 1\n"
+        "                        (default: on for a GPU backend)\n",
         prog, prog);
 }
 
@@ -114,6 +135,11 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--cfg-scale") { if (!(v = val("--cfg-scale"))) return false; a.cfg_scale = (float)std::atof(v); }
         else if (k == "--seed") { if (!(v = val("--seed"))) return false; a.seed = std::strtoull(v, nullptr, 10); }
         else if (k == "--threads" || k == "-t") { if (!(v = val("--threads"))) return false; a.threads = std::atoi(v); }
+        else if (k == "--backend" || k == "--device") { if (!(v = val("--backend"))) return false; a.backend = v; }
+        else if (k == "--decode-batch") { if (!(v = val("--decode-batch"))) return false; a.decode_batch = std::atoi(v); }
+        else if (k == "--profile") a.profile = true;
+        else if (k == "--overlap") a.overlap = 1;
+        else if (k == "--no-overlap") a.overlap = 0;
         else if (k == "--max-seconds") { if (!(v = val("--max-seconds"))) return false; a.max_seconds = std::atoi(v); }
         else if (k == "--audio-mode") {
             if (!(v = val("--audio-mode"))) return false;
@@ -421,14 +447,27 @@ int run_generate(const Args& a) {
 
     // ---- load ----
     auto t0 = Clock::now();
-    af::Backend be(n_threads);
+    size_t mem_free0 = 0, mem_total = 0;
+    af::Backend be(n_threads, a.backend);
+    if (!be.ok()) { std::fprintf(stderr, "error: backend %s is not available\n", a.backend.c_str()); return 1; }
+    ggml_backend_dev_memory(ggml_backend_get_device(be.handle()), &mem_free0, &mem_total);
     af::FlowModel flow(be);
     if (!flow.load(a.model)) { std::fprintf(stderr, "error: flow transformer load failed\n"); return 1; }
     af::AudioEncoder audio(be, flow);
     if (!audio.load(a.model)) { std::fprintf(stderr, "error: wav2vec2 load failed\n"); return 1; }
-    af::MotionModel motion(be);
+    // With overlap, the decoder gets its own backend instance (on a GPU: its
+    // own stream, graph allocator and buffers) and runs in a second thread.
+    const bool overlap = a.overlap < 0 ? !be.is_cpu() : a.overlap > 0;
+    std::unique_ptr<af::Backend> be_dec_own;
+    if (overlap) {
+        be_dec_own.reset(new af::Backend(n_threads, a.backend));
+        if (!be_dec_own->ok()) return 1;
+    }
+    af::Backend& bed = overlap ? *be_dec_own : be;
+    af::MotionModel motion(bed);
     if (!motion.load(a.model)) { std::fprintf(stderr, "error: motion autoencoder load failed\n"); return 1; }
-    motion.set_chunk_frames(1);
+    const int decode_batch = a.decode_batch >= 0 ? a.decode_batch : (bed.is_cpu() ? 1 : 0);
+    motion.set_chunk_frames(decode_batch);
     const double ms_load = ms_since(t0);
     const af::FlowConfig& fc = flow.config();
     const int fps = (int)gguf_u32(a.model, "avatarforcing.fps", 25);
@@ -535,54 +574,141 @@ int run_generate(const Args& a) {
     };
 
     double ms_sampler = 0, ms_decode = 0, ms_out = 0, ms_primer = 0;
-    std::vector<double> steady_ms, block_ms;
+    std::vector<double> steady_ms, decode_ms, period_ms;
     std::vector<float> wa, nz, x, pixels;
     std::vector<uint8_t> u8;
-    int decoded = 0;
+    int decoded = 0, blocks_done = 0;
+    const int n_primer_blocks = (clip + nb - 1) / nb;
+    const auto t_start = Clock::now();
+    auto t_last_done = t_start;
+    double ms_first_block = 0;
 
-    auto emit = [&](const float* latent, int n) -> bool {
+    // Convert and write one decoded block. period_ms: time between two
+    // finished steady blocks, the pipeline throughput.
+    auto output = [&](const std::vector<float>& px, int n) -> bool {
         auto td = Clock::now();
-        if (!motion.decode(latent, n, pixels)) { std::fprintf(stderr, "error: decoder failed\n"); return false; }
-        ms_decode += ms_since(td);
-        td = Clock::now();
-        af::MotionModel::to_u8(pixels.data(), n, S, S, u8);
+        af::MotionModel::to_u8(px.data(), n, S, S, u8);
         const bool ok = sink.write(u8.data(), n);
         ms_out += ms_since(td);
         decoded += n;
+        const auto now = Clock::now();
+        if (blocks_done == 0) ms_first_block = std::chrono::duration<double, std::milli>(now - t_start).count();
+        if (blocks_done >= n_primer_blocks) period_ms.push_back(std::chrono::duration<double, std::milli>(now - t_last_done).count());
+        t_last_done = now;
+        ++blocks_done;
+        if (!ok) std::fprintf(stderr, "error: writing frames failed\n");
         return ok;
+    };
+    auto decode = [&](const float* latent, int n, std::vector<float>& px) -> bool {
+        auto td = Clock::now();
+        if (a.profile) bed.set_profile(true);
+        const bool ok = motion.decode(latent, n, px);
+        if (a.profile) bed.set_profile(false);
+        if (!ok) { std::fprintf(stderr, "error: decoder failed\n"); return false; }
+        const double dms = ms_since(td);
+        ms_decode += dms;
+        if (n == nb) decode_ms.push_back(dms);
+        return true;
+    };
+
+    // With overlap: a decoder thread and an output thread (uint8 conversion
+    // and frame writing), each fed by a queue of at most two blocks, so the
+    // sampler, the decoder and the output of three blocks run at once.
+    struct Job { std::vector<float> data; int n; };
+    struct Stage {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<Job> q;
+        bool closing = false;
+        bool push(Job&& j, const std::atomic<bool>& failed) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return q.size() < 2 || failed; });
+            if (failed) return false;
+            q.push_back(std::move(j));
+            cv.notify_all();
+            return true;
+        }
+        bool pop(Job& j) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return closing || !q.empty(); });
+            if (q.empty()) return false;
+            j = std::move(q.front());
+            q.pop_front();
+            cv.notify_all();
+            return true;
+        }
+        void close() {
+            std::lock_guard<std::mutex> lk(mu);
+            closing = true;
+            cv.notify_all();
+        }
+    };
+    Stage to_decode, to_output;
+    std::atomic<bool> failed{false};
+    auto fail = [&] {
+        failed = true;
+        to_decode.cv.notify_all();
+        to_output.cv.notify_all();
+    };
+    std::thread dec_thread, out_thread;
+    if (overlap) {
+        dec_thread = std::thread([&] {
+            Job job;
+            while (to_decode.pop(job)) {
+                if (failed) continue;
+                Job done{{}, job.n};
+                if (!decode(job.data.data(), job.n, done.data) || !to_output.push(std::move(done), failed)) fail();
+            }
+            to_output.close();
+        });
+        out_thread = std::thread([&] {
+            Job job;
+            while (to_output.pop(job))
+                if (!failed && !output(job.data, job.n)) fail();
+        });
+    }
+    auto submit = [&](const float* latent, int n) -> bool {
+        if (!overlap) return decode(latent, n, pixels) && output(pixels, n);
+        return to_decode.push(Job{std::vector<float>(latent, latent + (size_t)n * D), n}, failed);
+    };
+    auto finish = [&]() -> bool {
+        if (overlap) {
+            to_decode.close();
+            dec_thread.join();
+            out_thread.join();
+        }
+        return !failed;
     };
 
     // ---- primer: clip frames, no KV read; decoded in blocks of nb ----
-    auto tb = Clock::now();
     window(0, clip, wa);
     noise.next((size_t)clip * D, nz);
     t0 = Clock::now();
-    if (!sampler.primer(wa.data(), nz.data(), x)) { std::fprintf(stderr, "error: primer failed\n"); return 1; }
+    if (!sampler.primer(wa.data(), nz.data(), x)) { std::fprintf(stderr, "error: primer failed\n"); finish(); return 1; }
     ms_primer = ms_since(t0);
     ms_sampler += ms_primer;
-    for (int b = 0; b < clip; b += nb) {
-        if (!emit(x.data() + (size_t)b * D, std::min(nb, clip - b))) return 1;
-        block_ms.push_back(ms_since(tb));
-        tb = Clock::now();
-    }
-    const double ms_first_block = block_ms.front();
+    for (int b = 0; b < clip; b += nb)
+        if (!submit(x.data() + (size_t)b * D, std::min(nb, clip - b))) { finish(); return 1; }
 
     // ---- steady blocks ----
     std::vector<float> latent;
     for (int t = clip; t < T; t += nb) {
-        tb = Clock::now();
         window(t - ctx, ctx + nb, wa);
         noise.next((size_t)nb * D, nz);
         t0 = Clock::now();
-        if (!sampler.steady(wa.data(), nz.data(), latent)) { std::fprintf(stderr, "error: steady block failed\n"); return 1; }
+        if (!sampler.steady(wa.data(), nz.data(), latent)) {
+            std::fprintf(stderr, "error: steady block failed\n");
+            finish();
+            return 1;
+        }
         const double ms = ms_since(t0);
         ms_sampler += ms;
         steady_ms.push_back(ms);
         // The last block keeps only the frames the audio covers.
-        if (!emit(latent.data(), std::min(nb, T - t))) return 1;
-        block_ms.push_back(ms_since(tb));
-        std::fprintf(stderr, "\rframes %d / %d", decoded, n_frames_out);
+        if (!submit(latent.data(), std::min(nb, T - t))) { finish(); return 1; }
+        if (!overlap) std::fprintf(stderr, "\rframes %d / %d", decoded, n_frames_out);
     }
+    if (!finish()) return 1;
     std::fprintf(stderr, "\n");
 
     t0 = Clock::now();
@@ -591,21 +717,35 @@ int run_generate(const Args& a) {
     const double ms_gen = ms_since(t_gen);
     const double ms_total = ms_since(t_all);
 
+    size_t mem_free1 = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(be.handle()), &mem_free1, &mem_total);
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
     const double clip_s = decoded / (double)fps;
     std::printf("frames: %d (%.2f s at %d fps)\n", decoded, clip_s, fps);
     if (!a.output.empty()) std::printf("output: %s\n", a.output.c_str());
     if (!a.frames_dir.empty()) std::printf("frames dir: %s\n", a.frames_dir.c_str());
-    std::printf("timings (%d threads):\n", n_threads);
+    std::printf("timings (%s, %d threads):\n", be.device().c_str(), n_threads);
     std::printf("  load            %9.1f ms\n", ms_load);
     std::printf("  portrait encode %9.1f ms\n", ms_encode);
     std::printf("  audio features  %9.1f ms  (%d frames)\n", ms_audio, T);
     std::printf("  sampler         %9.1f ms  (primer %.1f ms; steady %zu blocks, median %.1f ms/block)\n",
                 ms_sampler, ms_primer, steady_ms.size(), median(steady_ms));
-    std::printf("  decoder         %9.1f ms  (%.1f ms/frame)\n", ms_decode, decoded ? ms_decode / decoded : 0.0);
+    std::printf("  decoder         %9.1f ms  (%.1f ms/frame; full %d-frame block median %.1f ms, %d frame(s) per graph)\n",
+                ms_decode, decoded ? ms_decode / decoded : 0.0, nb, median(decode_ms),
+                decode_batch > 0 ? decode_batch : nb);
     std::printf("  uint8 + output  %9.1f ms\n", ms_out);
     std::printf("  generate        %9.1f ms  (encode + audio + sampler + decoder + output)\n", ms_gen);
     std::printf("  total           %9.1f ms  (with load)\n", ms_total);
-    std::printf("first block latency %.1f ms, per block median %.1f ms\n", ms_first_block, median(block_ms));
+    std::printf("first block latency %.1f ms (primer + first decoded block)\n", ms_first_block);
+    std::printf("steady blocks (%d frames each, %.0f ms of video): sampler median %.1f ms + decoder median %.1f ms "
+                "= %.1f ms; period between finished blocks median %.1f ms (%s)\n",
+                nb, 1000.0 * nb / fps, median(steady_ms), median(decode_ms), median(steady_ms) + median(decode_ms),
+                median(period_ms), overlap ? "decoder overlapped with the sampler" : "no overlap");
+    if (a.profile) bed.print_profile("decoder (all blocks)");
+    std::printf("memory: peak RSS %.0f MB; device memory in use at the end %.0f MB (free %.0f -> %.0f MB of %.0f MB)\n",
+                ru.ru_maxrss / 1024.0, ((double)mem_free0 - (double)mem_free1) / 1048576.0, mem_free0 / 1048576.0,
+                mem_free1 / 1048576.0, mem_total / 1048576.0);
     std::printf("realtime factor: %.2fx (generate / clip; < 1 is faster than real time), %.2fx with load\n",
                 ms_gen / 1000.0 / clip_s, ms_total / 1000.0 / clip_s);
     return 0;

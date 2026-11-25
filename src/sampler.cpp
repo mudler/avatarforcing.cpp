@@ -100,7 +100,11 @@ bool Sampler::init(int nfe, float cfg_scale) {
     zero_row_ = tbl_.row(0.0f);
 
     wr_.assign(c.dim_w, 0.f);
+    kv_ = KvCache();
     kv_.init(c, 2);
+    // The caches stay in backend buffers between forwards (no per-forward
+    // upload and download).
+    if (!kv_.alloc_device(model_.backend().handle())) return false;
     prev_x_.clear();
     start_pos_ = 0;
     primed_ = false;

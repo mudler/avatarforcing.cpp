@@ -6,7 +6,8 @@
 #include <cmath>
 #include <vector>
 
-// Arithmetic, chosen to match the PyTorch CPU kernel bit for bit
+// Host reference of GGML_OP_GRID_SAMPLE (the operator lives in the patched
+// ggml, patches/ggml-0001-*). Arithmetic, chosen to match the PyTorch CPU kernel bit for bit
 // (aten/src/ATen/native/cpu/GridSamplerKernel.cpp, float32, built with FMA
 // contraction, the default x86-64 AVX2 build):
 //
@@ -97,28 +98,10 @@ void run_rows(const float* feat, int w_in, int h_in, int c, int b_feat,
     }
 }
 
-void grid_sample_op(ggml_tensor* dst, int ith, int nth, void* /*userdata*/) {
-    const ggml_tensor* feat = dst->src[0];
-    const ggml_tensor* grid = dst->src[1];
-    const int w = (int)dst->ne[0], h = (int)dst->ne[1], b = (int)dst->ne[3];
-    const int64_t rows = (int64_t)b * h;
-    const int64_t per = (rows + nth - 1) / nth;
-    const int64_t r0 = std::min<int64_t>(rows, per * ith);
-    const int64_t r1 = std::min<int64_t>(rows, r0 + per);
-    run_rows((const float*)feat->data, (int)feat->ne[0], (int)feat->ne[1], (int)feat->ne[2],
-             (int)feat->ne[3], (const float*)grid->data, w, h, (float*)dst->data, r0, r1);
-}
-
 } // namespace
 
 ggml_tensor* grid_sample_bilinear_zeros(ggml_context* ctx, ggml_tensor* feat, ggml_tensor* grid) {
-    GGML_ASSERT(feat->type == GGML_TYPE_F32 && grid->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(feat) && ggml_is_contiguous(grid));
-    GGML_ASSERT(grid->ne[2] == 2);
-    GGML_ASSERT(feat->ne[3] == 1 || feat->ne[3] == grid->ne[3]);
-    ggml_tensor* args[2] = { feat, grid };
-    return ggml_custom_4d(ctx, GGML_TYPE_F32, grid->ne[0], grid->ne[1], feat->ne[2], grid->ne[3],
-                          args, 2, grid_sample_op, GGML_N_TASKS_MAX, nullptr);
+    return ggml_grid_sample(ctx, feat, grid);
 }
 
 void grid_sample_bilinear_zeros_host(const float* feat, int w_in, int h_in, int c, int b_feat,

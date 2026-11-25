@@ -140,6 +140,14 @@ Each is the same function as the reference; only the float rounding differs.
   normalized 2-D kernel.
 - `upfirdn2d` with up = 2 (the skip image and flow): zero insertion with
   `ggml_pad` and reshapes, padding, depthwise convolution.
+- The activation gain of FusedLeakyReLU (g = sqrt(2) > 0) is folded into the
+  demodulation and the bias: `leaky(y * (g / d) + g * b)` instead of
+  `leaky(y / d + b) * g`, one pass fewer over each StyledConv output.
+- The zero insertion of `upfirdn2d` (up = 2) and the phase interleave of the
+  transposed conv use `ggml_concat` on 3-D shapes (all outer dimensions
+  folded into `ne[2]`); `x * 0` provides the inserted zeros. On CUDA a 4-D
+  concat launches one kernel per `ne[3]` slice and a pad of a 1-wide row
+  leaves most threads idle.
 - The portrait features live in their own backend buffer
   (`MotionModel::set_portrait`) and are broadcast across the frames of a
   graph instead of repeated.

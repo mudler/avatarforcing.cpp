@@ -19,7 +19,55 @@ if(NOT DEFINED GGML_LLAMAFILE)
   set(GGML_LLAMAFILE ON CACHE BOOL "ggml: use LLAMAFILE (tinyBLAS SGEMM)" FORCE)
 endif()
 
-add_subdirectory(third_party/ggml)
+# ggml is used with the patches in patches/ applied: a grid_sample operator
+# with CPU and CUDA kernels, and a switch that keeps the CUDA GEMMs in full
+# float32 (no TF32). The submodule stays clean; configure copies it to the
+# build tree and applies the patches there.
+set(AF_GGML_SRC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
+set(AF_GGML_PATCHED ${CMAKE_CURRENT_BINARY_DIR}/ggml-patched)
+file(GLOB AF_GGML_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-*.patch)
+list(SORT AF_GGML_PATCHES)
+set(AF_GGML_STAMP_VALUE "")
+foreach(p ${AF_GGML_PATCHES})
+  file(SHA256 ${p} h)
+  string(APPEND AF_GGML_STAMP_VALUE "${h};")
+endforeach()
+execute_process(COMMAND git -C ${AF_GGML_SRC} rev-parse HEAD
+                OUTPUT_VARIABLE AF_GGML_REV OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+string(APPEND AF_GGML_STAMP_VALUE "${AF_GGML_REV}")
+set(AF_GGML_STAMP_FILE ${AF_GGML_PATCHED}/.af-patch-stamp)
+set(AF_GGML_OLD_STAMP "")
+if(EXISTS ${AF_GGML_STAMP_FILE})
+  file(READ ${AF_GGML_STAMP_FILE} AF_GGML_OLD_STAMP)
+endif()
+if(NOT AF_GGML_OLD_STAMP STREQUAL AF_GGML_STAMP_VALUE)
+  message(STATUS "avatarforcing: copying ggml and applying ${CMAKE_CURRENT_SOURCE_DIR}/patches")
+  file(REMOVE_RECURSE ${AF_GGML_PATCHED})
+  file(COPY ${AF_GGML_SRC}/ DESTINATION ${AF_GGML_PATCHED} PATTERN ".git" EXCLUDE)
+  foreach(p ${AF_GGML_PATCHES})
+    # The copy can sit inside another git work tree (the build tree of a
+    # checkout); stop git from finding it, or git apply skips every file.
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
+                            git apply --whitespace=nowarn ${p}
+                    WORKING_DIRECTORY ${AF_GGML_PATCHED} RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "avatarforcing: cannot apply ${p} to ggml")
+    endif()
+  endforeach()
+  file(STRINGS ${AF_GGML_PATCHED}/include/ggml.h af_check REGEX "ggml_grid_sample")
+  if(NOT af_check)
+    message(FATAL_ERROR "avatarforcing: the ggml patches did not apply")
+  endif()
+  file(WRITE ${AF_GGML_STAMP_FILE} "${AF_GGML_STAMP_VALUE}")
+endif()
+# CUDA in strict float32 (see patches/): no -use_fast_math, no TF32 GEMMs,
+# two-pass LayerNorm statistics; plus the implicit-GEMM convolution kernel.
+set(GGML_CUDA_NO_FAST_MATH ON)
+add_subdirectory(${AF_GGML_PATCHED} ggml)
+if(TARGET ggml-cuda)
+  target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_NO_TF32 GGML_CUDA_NORM_TWO_PASS GGML_CUDA_CONV2D_IGEMM
+                                                     GGML_CUDA_FUSE_CHAN_AFFINE GGML_CUDA_CONV2D_DW_TILED)
+endif()
 
 add_library(avatarforcing STATIC
     src/backend.cpp

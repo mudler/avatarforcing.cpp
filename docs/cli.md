@@ -1,8 +1,8 @@
 # avatarforcing-cli
 
 `avatarforcing-cli` turns a portrait and a speech recording into a lip-synced
-talking-head video. It runs the whole model in C++ on the ggml CPU backend
-and calls `ffmpeg` to encode the mp4.
+talking-head video. It runs the whole model in C++ on the ggml CPU or CUDA
+backend (`docs/gpu.md`) and calls `ffmpeg` to encode the mp4.
 
 ```sh
 avatarforcing-cli --model avatarforcing-f32.gguf --portrait portrait512.png \
@@ -26,9 +26,15 @@ avatarforcing-cli info avatarforcing-f32.gguf
 | `--audio-mode M` | `normalized` | `normalized` (offline path) or `raw` (live app) wav2vec2 input |
 | `--max-seconds N` | 30 | uses only the first N s of audio (0: no limit) |
 | `--threads N` | all cores | CPU threads |
+| `--backend B` | `cpu` | compute device: `cpu`, `cuda` or `cuda:N`; `--device` is an alias |
+| `--decode-batch N` | 1 on the CPU, 10 on a GPU | frames per decoder graph (0: a whole block) |
+| `--overlap`, `--no-overlap` | on for a GPU | decode block N in a second thread while the sampler computes block N + 1 |
+| `--profile` | off | per-op time profile of the decoder graphs (node by node, slow) |
 
 Give `-o`, `--frames-dir` or both. At the end the tool prints the time of
-each stage and the realtime factor: the generation time (portrait encoder,
+each stage, the sampler and decoder time of a steady block and the period
+between two finished blocks (with `--overlap` the two stages run at the same
+time, so the period is less than their sum), and the realtime factor: the generation time (portrait encoder,
 audio features, sampler, decoder and output) divided by the video length.
 A value below 1 is faster than real time. The tool also prints the factor
 with the model load included.
@@ -79,7 +85,9 @@ AvatarVoice:
    `t - 2 .. t + 9` (the last row repeated past the end), RoPE start position
    `t - 2`, KV read. The block keeps only `min(10, T - t)` frames, so the
    last block can be short.
-5. **Decoder.** One frame per graph, with style `s_r + latent`.
+5. **Decoder.** With style `s_r + latent`; one frame per graph on the CPU, a
+   block of 10 frames per graph on a GPU. With `--overlap` the decoder has
+   its own backend instance and thread, and a queue of at most two blocks.
 6. **uint8 conversion**, per block of frames as upstream yields them: clamp to
    [-1, 1], scale with the minimum and maximum of the whole block to
    [0, 255] (eps 1e-8), truncate.
@@ -95,7 +103,7 @@ The video has `max(50, T)` frames. When the audio is shorter than 2 s,
 - No face detection and crop: the portrait must be pre-cropped.
 - No user stream (listener audio and video). The AvatarVoice two-branch CFG
   replaces the user inputs by zeros, so they do not change the result.
-- float32 on the CPU. Upstream runs under bf16 autocast on CUDA.
+- float32 on the CPU or CUDA. Upstream runs under bf16 autocast on CUDA.
 - The noise comes from the built-in generator or from a file, not from
   `torch.randn`.
 - The steady-block KV update is folded into the last (t = 0) step of the

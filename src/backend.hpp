@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -20,16 +21,29 @@ namespace af {
 // during the build, runs the graph and returns. Input data must be uploaded
 // after the allocation, so the build function registers it with set_input()
 // instead of writing tensor data directly.
+//
+// The device is "cpu" or "cuda" ("cuda:N" for device N; "gpu" takes the first
+// GPU device of any ggml backend). Every node of a graph must be supported by
+// the device: compute() checks this before it runs a graph on a non-CPU
+// device and fails with the list of unsupported ops, so no op runs on the
+// CPU behind the caller's back.
 class Backend {
 public:
-    explicit Backend(int n_threads);
+    explicit Backend(int n_threads, const std::string& device = "cpu");
     ~Backend();
     Backend(const Backend&) = delete;
     Backend& operator=(const Backend&) = delete;
 
+    bool ok() const { return backend_ != nullptr; }
+    bool is_cpu() const { return is_cpu_; }
+    const std::string& device() const { return device_; }   // ggml device name, e.g. "CPU", "CUDA0"
     ggml_backend_t handle() const { return backend_; }
     int n_threads() const { return n_threads_; }
     void set_n_threads(int n);
+
+    // Device name from an environment variable (e.g. AVATARFORCING_TEST_BACKEND),
+    // "cpu" when it is unset.
+    static std::string device_from_env(const char* var);
 
     // Graph build context, valid during one compute() call.
     struct Graph {
@@ -47,10 +61,27 @@ public:
     bool compute(const std::function<bool(Graph&)>& build,
                  const std::function<void(Graph&)>& read);
 
+    // Profiling (AVATARFORCING_PROFILE=1 or set_profile(true)): compute()
+    // runs the graph one node at a time, synchronizes after each node and
+    // accumulates the time per op and per output width. Only for analysis:
+    // it disables kernel fusion and adds a sync per node.
+    void set_profile(bool on) { profile_ = on; }
+    void reset_profile() { prof_.clear(); }
+    void print_profile(const char* title) const;
+
 private:
+    bool check_ops(ggml_cgraph* gf) const;
+    bool compute_profiled(ggml_cgraph* gf);
+
     ggml_backend_t backend_ = nullptr;
     ggml_gallocr_t galloc_ = nullptr;
+    std::string device_;
+    bool is_cpu_ = true;
     int n_threads_ = 1;
+    bool profile_ = false;
+    bool log_ops_ = false;
+    struct ProfEntry { std::string key; double ms = 0; long count = 0; };
+    std::vector<ProfEntry> prof_;
 };
 
 } // namespace af
