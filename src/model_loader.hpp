@@ -42,7 +42,10 @@ struct FlowConfig {
     // audio projection
     uint32_t audio_proj_in = 0, audio_proj_out = 0;
     float audio_proj_ln_eps = 0.f;
-    // sampler (used by the sampler loop, M3)
+    // sampler
+    uint32_t default_nfe = 0;          // nfe of the live app
+    uint32_t num_train_timesteps = 0;  // first value of the step list
+    uint32_t sigma_table_len = 0;      // length of sched.sigmas / sched.timesteps
     float cfg_audio_scale = 0.f;
 };
 

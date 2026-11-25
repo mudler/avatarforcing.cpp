@@ -85,6 +85,10 @@ bool read_config(gguf_context* g, FlowConfig& c) {
     c.audio_proj_in          = r.u32("avatarforcing.audio.proj_in");
     c.audio_proj_out         = r.u32("avatarforcing.audio.proj_out");
     c.audio_proj_ln_eps      = r.f32("avatarforcing.audio.proj_ln_eps");
+    c.default_nfe            = r.u32("avatarforcing.sampler.default_nfe");
+    c.num_train_timesteps    = r.u32("avatarforcing.sampler.num_train_timesteps");
+    c.sigma_table_len        = r.u32("avatarforcing.sampler.sigma_table_len");
+    const std::string solver = r.str("avatarforcing.sampler.solver");
     c.cfg_audio_scale        = r.f32("avatarforcing.cfg.audio_scale");
     if (!r.ok) return false;
 
@@ -106,6 +110,8 @@ bool read_config(gguf_context* g, FlowConfig& c) {
     check(c.final_adaln_order.size() == 2 && c.final_adaln_order[0] == "shift" &&
           c.final_adaln_order[1] == "scale", "final_adaln.order");
     check(c.dim_a % c.cond_n_heads == 0, "dim_a % cond.n_heads");
+    check(solver == "closed_form_argmin_f64", "sampler.solver != closed_form_argmin_f64");
+    check(c.default_nfe >= 3, "sampler.default_nfe < 3");
     return ok;
 }
 
