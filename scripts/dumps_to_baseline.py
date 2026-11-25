@@ -14,12 +14,17 @@ Contents (tensor names; GGUF stores the numpy shape reversed, so a dump array
                           steady0_final)
   audio.<key>             stacked, proj.linear, proj.norm, features of
                           wav2vec_raw.npz (audio projection parity)
+  sampler<M>.*            every float array of sampler_nfe{M}.npz, for each
+                          nfe M of --sampler-nfe (sampler loop parity)
 
 Arrays with more than 4 dimensions (the KV caches, [layer, branch, head, pos,
 dim]) have their leading dimensions merged: ggml tensors have at most 4.
 
 KV: ``baseline.nfe``, ``baseline.steady0.start_pos`` and, per tag,
-``baseline.<tag>.update_kv_cache`` and ``baseline.<tag>.kv_read``.
+``baseline.<tag>.update_kv_cache`` and ``baseline.<tag>.kv_read``. For the
+sampler runs: ``baseline.sampler_nfe`` (the list of M), and per M
+``baseline.sampler<M>.sigma_index`` (i32 array), ``.a_cfg_scale``,
+``.steady_blocks`` and ``.steady.<b>.start_pos``.
 """
 from __future__ import annotations
 
@@ -37,6 +42,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dumps", required=True, help="directory written by dump_reference.py")
     ap.add_argument("--nfe", type=int, default=6, help="nfe of the detail run (default 6)")
+    ap.add_argument("--sampler-nfe", type=int, nargs="*", default=[6, 10],
+                    help="nfe of the sampler runs to include (default 6 10; none: skip)")
     ap.add_argument("--output", required=True, help="baseline GGUF to write")
     args = ap.parse_args()
 
@@ -82,6 +89,26 @@ def main():
 
     z = load(f"sampler_nfe{args.nfe}.npz")
     w.add_uint32("baseline.steady0.start_pos", int(z["steady.0.start_pos"]))
+
+    w.add_array("baseline.sampler_nfe", [int(m) for m in args.sampler_nfe])
+    for m in args.sampler_nfe:
+        z = load(f"sampler_nfe{m}.npz")
+        p = f"sampler{m}"
+        n_blocks = 0
+        for k in z.files:
+            a = z[k]
+            if k == "sigma_index":
+                w.add_array(f"baseline.{p}.sigma_index", [int(i) for i in a])
+            elif k == "a_cfg_scale":
+                w.add_float32(f"baseline.{p}.a_cfg_scale", float(a))
+            elif k.endswith(".start_pos"):
+                w.add_uint32(f"baseline.{p}.{k}", int(a))
+                n_blocks += 1
+            elif a.dtype == np.float32:
+                add(f"{p}.{k}", a)
+            else:
+                sys.exit(f"unexpected dtype {a.dtype} for sampler_nfe{m}.npz:{k}")
+        w.add_uint32(f"baseline.{p}.steady_blocks", n_blocks)
 
     z = load("wav2vec_raw.npz")
     for k in AUDIO_KEYS:

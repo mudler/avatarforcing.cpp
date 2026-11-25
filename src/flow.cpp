@@ -151,7 +151,7 @@ void read_tensor(ggml_tensor* t, std::vector<float>& out) {
 FlowModel::~FlowModel() = default;
 
 bool FlowModel::load(const std::string& gguf_path) {
-    if (!loader_.load(gguf_path, be_.handle(), {"ft.", "audio_projection."})) return false;
+    if (!loader_.load(gguf_path, be_.handle(), {"ft.", "audio_projection.", "sched."})) return false;
     const FlowConfig& c = loader_.config();
     auto T = [&](const std::string& n) { return loader_.require(n); };
 
