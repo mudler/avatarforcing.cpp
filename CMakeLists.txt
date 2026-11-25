@@ -8,6 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(AVATARFORCING_BUILD_TESTS "Build ctest targets" ON)
+option(AVATARFORCING_BUILD_CLI "Build the avatarforcing-cli tool" ON)
 
 # -march=native (GGML_NATIVE) and tinyBLAS SGEMM (GGML_LLAMAFILE) are free
 # speedups on the CPU backend. Use -DGGML_NATIVE=OFF for portable binaries.
@@ -35,6 +36,10 @@ set_source_files_properties(src/grid_sample.cpp src/motion.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
 target_include_directories(avatarforcing PUBLIC src)
 target_link_libraries(avatarforcing PUBLIC ggml)
+
+if(AVATARFORCING_BUILD_CLI)
+  add_subdirectory(examples/cli)
+endif()
 
 if(AVATARFORCING_BUILD_TESTS)
   enable_testing()

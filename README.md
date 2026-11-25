@@ -25,7 +25,7 @@ The model has three parts:
 | M3 | Sampler loop: primer, steady blocks, folded KV update, reanchor, CFG, closed-form solver, parity-gated | done |
 | M4 | Motion autoencoder: encoder, decoder with grid_sample warping, uint8 conversion, parity-gated | done |
 | M5 | wav2vec2 audio features (raw and normalized input), idle features, audio projection, parity-gated | done |
-| M6 | End-to-end CLI | not started |
+| M6 | `avatarforcing-cli`: portrait + speech WAV to mp4, end-to-end gate against the upstream streaming path | done |
 
 The C++ library holds all three parts in F32 on the ggml CPU backend: the
 flow transformer and its sampler loop (primer and steady blocks, rolling KV
@@ -33,6 +33,20 @@ cache, two-branch CFG), the motion autoencoder, and the wav2vec2 audio
 features. The parity results against the PyTorch dumps are in
 `docs/parity.md` (flow transformer and sampler), `docs/parity-motion.md` and
 `docs/parity-wav2vec2.md`.
+
+## Usage
+
+```sh
+avatarforcing-cli --model avatarforcing-f32.gguf --portrait portrait512.png \
+    --audio speech.wav -o out.mp4
+```
+
+The portrait must be a face-centred 512x512 image (`scripts/prepare_portrait.py`
+makes one); the tool does not detect faces. The WAV can have any sample rate
+and channel count. `ffmpeg` must be on `PATH` for the mp4 output;
+`--frames-dir DIR` writes PNG frames instead or as well. `docs/cli.md`
+describes all options, the pipeline and how it differs from the upstream
+code.
 
 ## Build and test
 
@@ -43,6 +57,9 @@ git submodule update --init
 cmake -B build -DGGML_NATIVE=ON
 cmake --build build -j8
 ```
+
+The tool is `build/examples/cli/avatarforcing-cli`. stb_image, stb_image_write
+and dr_wav are vendored under `third_party/`.
 
 The parity tests need the model GGUF and baseline GGUFs made from the
 reference dumps (see below). A test whose files are not set is skipped.
