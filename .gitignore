@@ -1,0 +1,17 @@
+/build*/
+/.venv/
+/models/*
+!/models/MANIFEST.md
+
+# Weights, converted models and reference dumps never enter the repo.
+*.gguf
+*.pth
+*.pt
+*.safetensors
+*.npz
+*.npy
+
+# Local scratch.
+__pycache__/
+*.pyc
+/.cache/

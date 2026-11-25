@@ -1,0 +1,10 @@
+TODO: the licence of the code in this repository is not decided yet.
+
+Third-party material has its own licence:
+
+- AvatarForcing model weights and upstream code: CC BY-NC 4.0
+  (https://creativecommons.org/licenses/by-nc/4.0/).
+- AvatarVoice code: CC BY-NC 4.0.
+- facebook/wav2vec2-base-960h weights: Apache-2.0.
+
+See README.md for attribution.
