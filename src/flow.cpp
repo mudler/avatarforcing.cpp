@@ -2,6 +2,7 @@
 #include "common.hpp"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <cmath>
@@ -11,6 +12,17 @@ namespace af {
 
 // ---------------------------------------------------------------------------
 // Host-side state
+
+struct KvCache::Device {
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<ggml_tensor*> t[2][4];   // [copy][kind][layer]
+    int cur = 0;
+    ~Device() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+};
 
 void KvCache::init(const FlowConfig& cfg, int n_branches) {
     depth = (int)cfg.depth;
@@ -23,6 +35,56 @@ void KvCache::init(const FlowConfig& cfg, int n_branches) {
     self_v.assign((size_t)depth * self_layer_size(), 0.f);
     cross_k.assign((size_t)depth * cross_layer_size(), 0.f);
     cross_v.assign((size_t)depth * cross_layer_size(), 0.f);
+    if (dev_) {
+        ggml_backend_buffer_clear(dev_->buf, 0);
+        dev_->cur = 0;
+    }
+    host_stale_ = false;
+}
+
+bool KvCache::alloc_device(ggml_backend_t backend) {
+    auto d = std::make_shared<Device>();
+    ggml_init_params p = { ggml_tensor_overhead() * (size_t)(8 * depth + 1), nullptr, true };
+    d->ctx = ggml_init(p);
+    if (!d->ctx) return false;
+    for (int c = 0; c < 2; ++c)
+        for (int k = 0; k < 4; ++k)
+            for (int l = 0; l < depth; ++l)
+                d->t[c][k].push_back(ggml_new_tensor_4d(d->ctx, GGML_TYPE_F32, head_dim, k < 2 ? self_len : cross_len,
+                                                        heads, branches));
+    d->buf = ggml_backend_alloc_ctx_tensors(d->ctx, backend);
+    if (!d->buf) { AF_LOG("KV cache: device buffer allocation failed"); return false; }
+    ggml_backend_buffer_clear(d->buf, 0);
+    dev_ = std::move(d);
+    host_stale_ = false;
+    // The host vectors may hold a cache already: start from it.
+    std::vector<float>* h[4] = {&self_k, &self_v, &cross_k, &cross_v};
+    for (int k = 0; k < 4; ++k) {
+        const size_t per = k < 2 ? self_layer_size() : cross_layer_size();
+        for (int l = 0; l < depth; ++l)
+            ggml_backend_tensor_set(dev_->t[0][k][l], h[k]->data() + (size_t)l * per, 0, per * sizeof(float));
+    }
+    return true;
+}
+
+ggml_tensor* KvCache::dev_tensor(int copy, int kind, int layer) const {
+    return dev_->t[(dev_->cur + copy) & 1][kind][layer];
+}
+
+void KvCache::swap_device() {
+    dev_->cur ^= 1;
+    host_stale_ = true;
+}
+
+void KvCache::sync_host() {
+    if (!dev_ || !host_stale_) return;
+    std::vector<float>* h[4] = {&self_k, &self_v, &cross_k, &cross_v};
+    for (int k = 0; k < 4; ++k) {
+        const size_t per = k < 2 ? self_layer_size() : cross_layer_size();
+        for (int l = 0; l < depth; ++l)
+            ggml_backend_tensor_get(dev_tensor(0, k, l), h[k]->data() + (size_t)l * per, 0, per * sizeof(float));
+    }
+    host_stale_ = false;
 }
 
 int AdaLNTable::row(float t) const {
@@ -364,6 +426,7 @@ bool FlowModel::forward(const ForwardArgs& a, std::vector<float>& v_out, Taps* t
     // The reference concatenates the caches only for the steady shape.
     const bool kv_read = a.kv && steady;
     const bool kv_write = a.kv && a.update_kv;
+    const bool kv_dev = a.kv && a.kv->on_device();
 
     if (!(N == (int64_t)c.clip_frames || steady)) {
         AF_LOG("forward: N = %lld is neither the primer nor the steady shape", (long long)N);
@@ -477,9 +540,14 @@ bool FlowModel::forward(const ForwardArgs& a, std::vector<float>& v_out, Taps* t
             ggml_tensor *k_attn = k, *v_attn = v;
             ggml_tensor *k_cache = nullptr, *v_cache = nullptr;
             if (kv_read) {
-                const size_t off = (size_t)li * a.kv->self_layer_size();
-                k_cache = g.input(a.kv->self_k.data() + off, hd, L, H, B);
-                v_cache = g.input(a.kv->self_v.data() + off, hd, L, H, B);
+                if (kv_dev) {
+                    k_cache = a.kv->dev_tensor(0, 0, li);
+                    v_cache = a.kv->dev_tensor(0, 1, li);
+                } else {
+                    const size_t off = (size_t)li * a.kv->self_layer_size();
+                    k_cache = g.input(a.kv->self_k.data() + off, hd, L, H, B);
+                    v_cache = g.input(a.kv->self_v.data() + off, hd, L, H, B);
+                }
                 k_attn = ggml_concat(ctx, k_cache, k, 1);
                 v_attn = ggml_concat(ctx, v_cache, v, 1);
             }
@@ -507,9 +575,17 @@ bool FlowModel::forward(const ForwardArgs& a, std::vector<float>& v_out, Taps* t
             ggml_tensor* cv = to_heads_first(ctx, heads_view(ctx, ckv, hd, H, N, B, (size_t)D * es));
             ggml_tensor *ck_attn = ck, *cv_attn = cv;
             if (kv_read) {
-                const size_t off = (size_t)li * a.kv->cross_layer_size();
-                ck_attn = ggml_concat(ctx, g.input(a.kv->cross_k.data() + off, hd, Lc, H, B), ck, 1);
-                cv_attn = ggml_concat(ctx, g.input(a.kv->cross_v.data() + off, hd, Lc, H, B), cv, 1);
+                ggml_tensor *ckc, *cvc;
+                if (kv_dev) {
+                    ckc = a.kv->dev_tensor(0, 2, li);
+                    cvc = a.kv->dev_tensor(0, 3, li);
+                } else {
+                    const size_t off = (size_t)li * a.kv->cross_layer_size();
+                    ckc = g.input(a.kv->cross_k.data() + off, hd, Lc, H, B);
+                    cvc = g.input(a.kv->cross_v.data() + off, hd, Lc, H, B);
+                }
+                ck_attn = ggml_concat(ctx, ckc, ck, 1);
+                cv_attn = ggml_concat(ctx, cvc, cv, 1);
             }
             ggml_tensor* catt = linear(ctx, sdpa(ctx, cq, ck_attn, cv_attn, cmask, scale), bw.cproj_w, bw.cproj_b);
             if (t0) tap(g, list, taps, bp + "cross_out", catt);
@@ -527,8 +603,17 @@ bool FlowModel::forward(const ForwardArgs& a, std::vector<float>& v_out, Taps* t
             h = ggml_add(ctx, h, ggml_mul(ctx, m, gate_mlp));
             tap(g, list, taps, "block." + std::to_string(li), h);
 
-            if (kv_write)
-                for (ggml_tensor* t : {kv_out[li].sk, kv_out[li].sv, kv_out[li].ck, kv_out[li].cv}) out_expand(t);
+            if (kv_write) {
+                if (kv_dev) {
+                    // Into the other copy; the current one is still read by
+                    // this graph.
+                    ggml_tensor* src[4] = {kv_out[li].sk, kv_out[li].sv, kv_out[li].ck, kv_out[li].cv};
+                    for (int k = 0; k < 4; ++k)
+                        ggml_build_forward_expand(g.gf, ggml_cpy(ctx, src[k], a.kv->dev_tensor(1, k, li)));
+                } else {
+                    for (ggml_tensor* t : {kv_out[li].sk, kv_out[li].sv, kv_out[li].ck, kv_out[li].cv}) out_expand(t);
+                }
+            }
         }
 
         // Final layer.
@@ -540,7 +625,7 @@ bool FlowModel::forward(const ForwardArgs& a, std::vector<float>& v_out, Taps* t
     auto read = [&](Backend::Graph&) {
         read_tensor(out, v_out);
         read_taps(list, taps);
-        if (kv_write) {
+        if (kv_write && !kv_dev) {
             for (uint32_t li = 0; li < c.depth; ++li) {
                 const size_t so = (size_t)li * a.kv->self_layer_size(), co = (size_t)li * a.kv->cross_layer_size();
                 ggml_backend_tensor_get(kv_out[li].sk, a.kv->self_k.data() + so, 0, ggml_nbytes(kv_out[li].sk));
@@ -550,7 +635,9 @@ bool FlowModel::forward(const ForwardArgs& a, std::vector<float>& v_out, Taps* t
             }
         }
     };
-    return be_.compute(build, read);
+    if (!be_.compute(build, read)) return false;
+    if (kv_write && kv_dev) a.kv->swap_device();
+    return true;
 }
 
 // ---------------------------------------------------------------------------

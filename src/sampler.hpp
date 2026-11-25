@@ -72,7 +72,8 @@ public:
     int nfe() const { return sched_.nfe; }
     float cfg_scale() const { return cfg_; }
     const Schedule& schedule() const { return sched_; }
-    const KvCache& kv() const { return kv_; }
+    // The caches live on the compute device; this refreshes the host copy.
+    const KvCache& kv() { kv_.sync_host(); return kv_; }
     const AdaLNTable& adaln() const { return tbl_; }
 
 private:

@@ -7,19 +7,44 @@
 #include <string>
 #include <vector>
 
+struct ggml_context;
+struct ggml_tensor;
+struct ggml_backend_buffer;
+typedef struct ggml_backend_buffer* ggml_backend_buffer_t;
+
 namespace af {
 
-// Rolling KV caches of the flow transformer, kept on the host between
-// forwards. Layout [layer, branch, head, pos, head_dim] (row-major), the same
-// layout as the reference dumps. The self cache holds post-RoPE keys.
+// Rolling KV caches of the flow transformer. Layout [layer, branch, head,
+// pos, head_dim] (row-major), the same layout as the reference dumps. The self
+// cache holds post-RoPE keys.
+//
+// By default the caches live in the host vectors and every forward uploads
+// them. After alloc_device() they live in backend buffers instead, in two
+// copies: a forward reads the current copy and writes the updated cache into
+// the other one, then the copies swap. The host vectors are then only a
+// mirror that sync_host() refreshes (for tests and debugging).
 struct KvCache {
     int depth = 0, branches = 0, heads = 0, head_dim = 0;
     int self_len = 0, cross_len = 0;
     std::vector<float> self_k, self_v, cross_k, cross_v;
 
-    void init(const FlowConfig& cfg, int n_branches);   // zero-filled
+    void init(const FlowConfig& cfg, int n_branches);   // zero-filled (host and device)
     size_t self_layer_size() const { return (size_t)branches * heads * self_len * head_dim; }
     size_t cross_layer_size() const { return (size_t)branches * heads * cross_len * head_dim; }
+
+    // Device storage. Call after init(); the shape is fixed from then on.
+    bool alloc_device(ggml_backend_t backend);
+    bool on_device() const { return dev_ != nullptr; }
+    // Kind: 0 self_k, 1 self_v, 2 cross_k, 3 cross_v. copy: 0 = current
+    // (read), 1 = next (written). [head_dim, len, heads, branches] per layer.
+    ggml_tensor* dev_tensor(int copy, int kind, int layer) const;
+    void swap_device();          // after a forward that wrote the next copy
+    void sync_host();            // device -> host vectors, when they are stale
+
+private:
+    struct Device;
+    std::shared_ptr<Device> dev_;
+    bool host_stale_ = false;
 };
 
 // Timestep embeddings and adaLN rows, one row per timestep.
@@ -64,6 +89,7 @@ public:
     bool load(const std::string& gguf_path);
     const FlowConfig& config() const { return loader_.config(); }
     const ModelLoader& loader() const { return loader_; }
+    Backend& backend() { return be_; }
 
     // Timestep embedding and adaLN rows for the given timesteps.
     bool timestep_tables(const std::vector<float>& timesteps, AdaLNTable& out);
