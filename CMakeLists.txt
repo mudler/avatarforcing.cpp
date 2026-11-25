@@ -7,6 +7,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+option(AVATARFORCING_BUILD_TESTS "Build ctest targets" ON)
+
 # -march=native (GGML_NATIVE) and tinyBLAS SGEMM (GGML_LLAMAFILE) are free
 # speedups on the CPU backend. Use -DGGML_NATIVE=OFF for portable binaries.
 if(NOT DEFINED GGML_NATIVE)
@@ -24,3 +26,8 @@ add_library(avatarforcing STATIC
     src/flow.cpp)
 target_include_directories(avatarforcing PUBLIC src)
 target_link_libraries(avatarforcing PUBLIC ggml)
+
+if(AVATARFORCING_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

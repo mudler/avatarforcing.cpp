@@ -21,10 +21,35 @@ The model has three parts:
 |---|---|---|
 | M0 | Reference dumps from the PyTorch code, CPU float32, injected noise | done |
 | M1 | Metadata-driven GGUF converter and round-trip check | done |
-| M2+ | C++/ggml forward passes, sampler, decoder, CLI | not started |
+| M2 | C++/ggml flow transformer forward (condition embedder, adaLN tables, 8 blocks, KV caches), parity-gated | done |
+| M3+ | Sampler loop, motion decoder, wav2vec2, CLI | not started |
 
-There is no C++ code yet. The repository holds the Python tooling that
-produces the parity targets and the GGUF file that the C++ engine will load.
+The C++ library holds the flow transformer forward pass: the primer shape
+(50 tokens, no cache read) and the steady shape (12 tokens, cache read), with
+the KV cache update, for the two CFG branches, in F32 on the ggml CPU backend.
+`docs/parity.md` gives the parity results against the PyTorch dumps.
+
+## Build and test
+
+ggml is a git submodule (`third_party/ggml`, pinned at v0.15.2).
+
+```sh
+git submodule update --init
+cmake -B build -DGGML_NATIVE=ON
+cmake --build build -j8
+```
+
+The parity test needs the model GGUF and a baseline GGUF made from the
+reference dumps (see below). Without them it is skipped.
+
+```sh
+python scripts/dumps_to_baseline.py --dumps dumps-gold --nfe 6 \
+    --output flow-baseline-nfe6.gguf
+AVATARFORCING_TEST_GGUF=avatarforcing-f32.gguf \
+AVATARFORCING_TEST_BASELINE=flow-baseline-nfe6.gguf \
+AVATARFORCING_TEST_THREADS=8 \
+ctest --test-dir build --output-on-failure
+```
 
 ## Reference tooling
 
