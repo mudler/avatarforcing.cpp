@@ -124,10 +124,13 @@ python scripts/dump_reference.py --avatarvoice AvatarVoice \
 
 ## Licence and attribution
 
-The model weights and the upstream code are licensed under
+The code in this repository is licensed under the MIT licence. See `LICENSE`.
+
+The AvatarForcing model weights and the upstream AvatarForcing and AvatarVoice
+code are licensed under
 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
-(non-commercial use only). GGUF files converted from these weights carry the
-same licence.
+(non-commercial use only). GGUF files converted with this repository carry the
+same licence, so you can use them only for non-commercial purposes.
 
 - **AvatarForcing**: Taekyung Ki, Sangwon Jang, Jaehyeong Jo, Jaehong Yoon,
   Sung Ju Hwang. *Avatar Forcing: Real-Time Interactive Head Avatar Generation
@@ -141,4 +144,8 @@ same licence.
   [code](https://github.com/johnrobinsn/AvatarVoice).
 - **wav2vec 2.0** (`facebook/wav2vec2-base-960h`), Apache-2.0.
 
-The licence of the code in this repository is not decided yet. See `LICENSE`.
+Vendored third-party code keeps its own licence:
+
+- `third_party/ggml`: MIT.
+- `third_party/stb`: MIT or public domain (Unlicense), at your choice.
+- `third_party/dr_libs`: public domain (Unlicense) or MIT-0, at your choice.
