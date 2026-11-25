@@ -129,6 +129,7 @@ def build_model(args):
     import torch
     from omegaconf import OmegaConf
     af_dir = os.path.join(args.avatarvoice, "avatarforcing")
+    sys.dont_write_bytecode = True  # leave the upstream checkout untouched
     sys.path.insert(0, af_dir)
     sys.path.insert(0, args.avatarvoice)
     from models.avatarforcing.AvatarForcing import AvatarForcing
