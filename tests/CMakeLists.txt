@@ -9,3 +9,6 @@ endfunction()
 
 af_add_test(test_flow_parity)
 set_tests_properties(test_flow_parity PROPERTIES LABELS "model" TIMEOUT 1800)
+
+af_add_test(test_motion_parity)
+set_tests_properties(test_motion_parity PROPERTIES LABELS "model" TIMEOUT 1800)
