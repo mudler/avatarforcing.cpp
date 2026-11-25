@@ -75,3 +75,67 @@ The test prints the full table on every run.
 - The masks are built from the KV (`flow.self_mask.*`,
   `flow.cross_mask.window`, cache lengths), never from the checkpoint
   buffers.
+
+# Parity (M3: sampler loop)
+
+`tests/test_sampler_parity.cpp` runs `af::Sampler` on the inputs of
+`sampler_nfe6.npz` and `sampler_nfe10.npz` (`docs/reference.md`): the primer
+and 6 steady blocks, from the injected noise, with the engine's own x and
+caches carried from step to step. Nothing is re-injected from the reference
+between steps or blocks.
+
+## Metric and gate
+
+The same metric as above. A tensor passes when `max_rel <= 1e-3` and every
+value is finite. The test checks:
+
+- the step list and the sigma index of each step (exact);
+- the start position of each steady block (exact);
+- x after each step, the raw transformer output of each step (both CFG
+  branches), the primer's KV-update output, `primer.x_final` and the latents
+  of each steady block;
+- the four caches after the primer and after each steady block.
+
+The dumps do not cover the reanchor. The test checks it against the engine's
+own run instead: after the 6 steady blocks, a reanchor on the primer inputs
+must reproduce the primer x and caches, the start position 48 and the
+latents of steady block 0 bit for bit.
+
+## Results
+
+CPU backend, F32, 8 threads, `GGML_NATIVE=ON`. 278 tensors, all pass. Worst
+tensor per block, `max_abs / max_rel`:
+
+| Block | nfe 6: x and latents | nfe 6: caches | nfe 10: x and latents | nfe 10: caches |
+|---|---|---|---|---|
+| primer | 2.6e-06 / 1.1e-06 | 7.5e-05 / 7.9e-06 | 2.1e-06 / 7.7e-07 | 7.2e-05 / 6.3e-06 |
+| steady 0 | 3.8e-06 / 2.8e-06 | 7.3e-05 / 7.8e-06 | 2.7e-06 / 1.4e-06 | 7.2e-05 / 6.3e-06 |
+| steady 1 | 5.5e-06 / 4.7e-06 | 7.3e-05 / 8.4e-06 | 4.0e-06 / 3.6e-06 | 7.1e-05 / 6.2e-06 |
+| steady 2 | 7.8e-06 / 6.9e-06 | 7.3e-05 / 1.0e-05 | 4.3e-06 / 4.0e-06 | 7.1e-05 / 6.2e-06 |
+| steady 3 | 8.7e-06 / 4.9e-06 | 7.3e-05 / 9.2e-06 | 4.2e-06 / 2.5e-06 | 5.1e-05 / 5.4e-06 |
+| steady 4 | 7.6e-06 / 4.5e-06 | 7.3e-05 / 9.2e-06 | 3.3e-06 / 1.7e-06 | 5.1e-05 / 5.4e-06 |
+| steady 5 | 5.8e-06 / 3.2e-06 | 7.3e-05 / 9.2e-06 | 9.9e-06 / 5.8e-06 | 7.5e-05 / 6.5e-06 |
+
+The error does not grow over the blocks: it stays between 1e-6 and 1e-5
+relative, two orders of magnitude under the gate. The raw transformer
+outputs stay under 1.5e-5 relative.
+
+Time on the same machine (median of 5 steady blocks, each with the
+condition embedder, all forwards and the folded KV update):
+
+| nfe | Forwards per steady block | Steady block | Per frame | Primer |
+|---|---|---|---|---|
+| 6 | 5 | 204 ms | 20 ms | 0.62 s |
+| 10 | 9 | 334 ms | 33 ms | 0.99 s |
+
+## Sampler notes
+
+- Step list: `linspace(num_train_timesteps, 0, nfe - 1)` in float64, stored
+  as float32. Sigma: argmin of `|sched.timesteps - t|` in float64 over the
+  float32 tables, forced to 0 at t = 0 (t = 750 gives index 250,
+  sigma 0.74975).
+- CFG runs in float32 (`v_u + s * (v_a - v_u)`, uncond branch first); the
+  closed-form update runs in float64, as `solve_closed` does.
+- The t = 0 step does not change x. The primer skips it and runs the
+  separate KV-update forward instead; a steady block runs it only for the
+  folded KV update.

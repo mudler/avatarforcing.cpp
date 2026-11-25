@@ -9,3 +9,6 @@ endfunction()
 
 af_add_test(test_flow_parity)
 set_tests_properties(test_flow_parity PROPERTIES LABELS "model" TIMEOUT 1800)
+
+af_add_test(test_sampler_parity)
+set_tests_properties(test_sampler_parity PROPERTIES LABELS "model" TIMEOUT 3600)
