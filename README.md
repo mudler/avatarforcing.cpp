@@ -26,8 +26,10 @@ The model has three parts:
 | M4 | Motion autoencoder: encoder, decoder with grid_sample warping, uint8 conversion, parity-gated | done |
 | M5 | wav2vec2 audio features (raw and normalized input), idle features, audio projection, parity-gated | done |
 | M6 | `avatarforcing-cli`: portrait + speech WAV to mp4, end-to-end gate against the upstream streaming path | done |
+| M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; at the edge of real time at nfe 6 on an NVIDIA Thor | done |
 
-The C++ library holds all three parts in F32 on the ggml CPU backend: the
+The C++ library holds all three parts in F32 on the ggml CPU or CUDA backend
+(`docs/gpu.md`): the
 flow transformer and its sampler loop (primer and steady blocks, rolling KV
 cache, two-branch CFG), the motion autoencoder, and the wav2vec2 audio
 features. The parity results against the PyTorch dumps are in
@@ -61,6 +63,12 @@ cmake --build build -j8
 The tool is `build/examples/cli/avatarforcing-cli`. stb_image, stb_image_write
 and dr_wav are vendored under `third_party/`.
 
+For the CUDA backend add `-DGGML_CUDA=ON` (and `-DCMAKE_CUDA_ARCHITECTURES=...`
+for your GPU) and run the tool with `--backend cuda`; see `docs/gpu.md`.
+CMake applies the ggml patches in `patches/` to a copy of the submodule in
+the build tree (a `grid_sample` operator and strict float32 settings for
+CUDA), so `git` must be on `PATH` at configure time.
+
 The parity tests need the model GGUF and baseline GGUFs made from the
 reference dumps (see below). A test whose files are not set is skipped.
 
@@ -78,6 +86,8 @@ AVATARFORCING_TEST_W2V2_BASELINE=w2v2-baseline.gguf \
 AVATARFORCING_TEST_THREADS=8 \
 ctest --test-dir build --output-on-failure
 ```
+
+`AVATARFORCING_TEST_BACKEND=cuda` runs the tests on the GPU.
 
 `test_flow_parity` and `test_sampler_parity` read the flow baseline,
 `test_motion_parity` the motion baseline and `test_wav2vec2_parity` the
