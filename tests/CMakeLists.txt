@@ -15,3 +15,6 @@ set_tests_properties(test_sampler_parity PROPERTIES LABELS "model" TIMEOUT 3600)
 
 af_add_test(test_motion_parity)
 set_tests_properties(test_motion_parity PROPERTIES LABELS "model" TIMEOUT 1800)
+
+af_add_test(test_wav2vec2_parity)
+set_tests_properties(test_wav2vec2_parity PROPERTIES LABELS "model" TIMEOUT 1800)
