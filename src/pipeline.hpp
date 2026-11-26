@@ -168,6 +168,14 @@ public:
     // run(true), then waits for the decoder and output threads.
     bool finish(std::string& err);
 
+    // Live mode (src/live.hpp). The caller gives the features of each block
+    // and does not use add_features, run or finish.
+    // A primer that writes the caches and outputs no frames. wa [clip, E].
+    bool primer_hidden(const float* wa, std::string& err);
+    // One steady block of block_frames output frames. wa [context + block, E]:
+    // the features of the context frames, then of the new frames.
+    bool steady_block(const float* wa, std::string& err);
+
     // A decoder or output thread failed; err receives its message.
     bool failed(std::string* err = nullptr) const;
 

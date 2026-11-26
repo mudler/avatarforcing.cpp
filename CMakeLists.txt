@@ -92,7 +92,8 @@ add_library(avatarforcing STATIC
     src/motion.cpp
     src/wav2vec2.cpp
     src/audio_io.cpp
-    src/pipeline.cpp)
+    src/pipeline.cpp
+    src/live.cpp)
 # grid_sample.cpp reproduces the rounding of the PyTorch CPU kernel with
 # explicit fmaf calls; motion.cpp builds the base grids like numpy. Neither may
 # get extra fused multiply-adds from the compiler.

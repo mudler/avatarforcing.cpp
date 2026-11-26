@@ -487,6 +487,40 @@ bool Generator::run(bool final, std::string& err) {
     return true;
 }
 
+bool Generator::primer_hidden(const float* wa, std::string& err) {
+    if (!sampler_) { err = "the sampler is not set up"; return false; }
+    if (primed_) { err = "the primer has already run"; return false; }
+    if (cancel_ && cancel_->load()) { err = "cancelled"; return false; }
+    t_start_ = Clock::now();
+    t_last_done_ = t_start_;
+    n_primer_blocks_ = 0;   // no primer frames: every output block is a steady block
+    if (!noise_.next((size_t)clip_ * D_, nz_, err)) return false;
+    clear_last_log();
+    const auto t0 = Clock::now();
+    if (!sampler_->primer(wa, nz_.data(), x_)) { err = with_cause("primer failed"); return false; }
+    stats_.ms_primer = ms_since(t0);
+    stats_.ms_sampler += stats_.ms_primer;
+    primed_ = true;
+    t_ = clip_;
+    return true;
+}
+
+bool Generator::steady_block(const float* wa, std::string& err) {
+    if (!primed_) { err = "steady block before the primer"; return false; }
+    if (failed_) return failed_error(err);
+    if (cancel_ && cancel_->load()) { err = "cancelled"; return false; }
+    if (!noise_.next((size_t)nb_ * D_, nz_, err)) return false;
+    clear_last_log();
+    const auto t0 = Clock::now();
+    if (!sampler_->steady(wa, nz_.data(), latent_)) { err = with_cause("steady block failed"); return false; }
+    const double ms = ms_since(t0);
+    stats_.ms_sampler += ms;
+    stats_.steady_ms.push_back(ms);
+    if (!submit(latent_.data(), nb_, err)) return false;
+    t_ += nb_;
+    return true;
+}
+
 bool Generator::finish(std::string& err) {
     bool ok = run(true, err);
     stop_threads();

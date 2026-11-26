@@ -51,7 +51,7 @@
  * Video. Frames are 8-bit RGB, row-major [n_frames, height, width, 3], at
  * `fps` frames per second (the GGUF value, 25). The video has
  * max(clip_frames, T) frames for T = ceil(seconds * fps) audio frames: the
- * whole primer (50 frames, 2 s) is always output.
+ * whole primer (50 frames, 2 s) is always output, except in live mode.
  *
  * Audio. PCM is mono float in [-1, 1]. A sample rate other than 16000 is
  * resampled to 16 kHz.
@@ -60,8 +60,9 @@
  * time in different threads. The calls on one context are serialized by a
  * lock in the context, so they are safe from any thread but run one at a
  * time; a context holds one model and runs one generation at a time.
- * avatarforcing_cancel and the session functions frames_ready and
- * pull_frames do not wait for that lock (see each function).
+ * avatarforcing_cancel and the session functions frames_ready,
+ * pull_frames, interrupt and stats_json do not wait for that lock (see each
+ * function).
  * avatarforcing_last_error returns a pointer into the context that the next
  * failing call on the context overwrites; copy it before the next call.
  */
@@ -193,28 +194,30 @@ AVATARFORCING_API int avatarforcing_generate_mp4_pcm(avatarforcing_ctx* ctx, con
  * sampler has computed the ready blocks, and their frames become ready
  * later. Without overlap, push returns when the frames are ready.
  *
- * Not implemented yet (the real-time milestone): idle frames when no audio
- * arrives (the upstream live app feeds pink-noise idle features), the
- * periodic re-run of the primer (reanchor) for unlimited sessions, and a
- * hidden primer. A session now follows the audio only.
+ * A session opened with "live": true works differently: see "live mode"
+ * below.
  *
  * A context has at most one open session. While it is open, the offline
  * generate functions on the context fail. */
 
 /* Opens a session with a portrait (as in avatarforcing_generate_frames) and
- * request options. Returns NULL on error (avatarforcing_last_error(ctx)). */
+ * request options. Returns NULL on error (avatarforcing_last_error(ctx)).
+ * Besides the request options, request_json can hold the session options of
+ * live mode (see below): "live", "live_queue_blocks" and
+ * "live_max_ahead_seconds". A live session runs the hidden primer here. */
 AVATARFORCING_API avatarforcing_session* avatarforcing_session_open(avatarforcing_ctx* ctx,
                                                                     const char* portrait_path,
                                                                     const char* request_json);
 
 /* Adds one phrase of mono float PCM and computes the blocks it completes.
- * n_samples 0 does nothing. Fails after avatarforcing_session_flush.
+ * n_samples 0 does nothing. Fails after avatarforcing_session_flush and on
+ * a live session.
  * Errors go to avatarforcing_last_error of the session's context. */
 AVATARFORCING_API int avatarforcing_session_push_pcm(avatarforcing_session* s, const float* pcm, int n_samples,
                                                      int sample_rate);
 
 /* Ends the audio: computes the remaining blocks and waits until all frames
- * are ready. */
+ * are ready. Fails on a live session. */
 AVATARFORCING_API int avatarforcing_session_flush(avatarforcing_session* s);
 
 /* The number of frames that are ready to pull. Callable from another thread
@@ -234,6 +237,101 @@ AVATARFORCING_API int avatarforcing_session_pull_frames(avatarforcing_session* s
  * pulled are dropped. Do not call it while another thread uses the
  * session. */
 AVATARFORCING_API void avatarforcing_session_close(avatarforcing_session* s);
+
+/* ---- live mode ------------------------------------------------------------ */
+
+/* A live session drives the face for as long as a call lasts, as the
+ * upstream live app does. The library has no timer: the caller calls
+ * avatarforcing_session_step once per block (block_frames = 10 frames,
+ * 400 ms at 25 fps), a little before the block is due. Each step computes
+ * exactly one block. Where a phrase covers a frame, the frame gets the
+ * features of the phrase (lip-sync); elsewhere it gets the idle features
+ * (wav2vec2 on the pink-noise room tone in the GGUF, read cyclically), so the
+ * face moves slightly and the mouth stays closed.
+ *
+ * Session options (avatarforcing_session_open):
+ *   "live"                    bool  true: open a live session
+ *   "live_queue_blocks"       int   blocks that may wait for pull, 1 to 1000
+ *                                   (default 3)
+ *   "live_max_ahead_seconds"  int   a phrase must end at most this far after
+ *                                   the next block (default 30)
+ * In a live session "audio_mode" defaults to "raw", as in the live app.
+ *
+ * Frames. Frame indices are int64_t and count from 0, the first frame of the
+ * first step. The 50 primer frames are not output: session_open runs the
+ * primer on idle features and only writes the caches. Frames come out in
+ * order, block_frames per step, with no gap.
+ *
+ * Phrases. avatarforcing_session_push_phrase runs wav2vec2 on the whole
+ * phrase and returns the frame where it starts; play its audio from that
+ * frame on (frame f plays at f / fps seconds after frame 0). A phrase can
+ * start only at a frame that no step has computed yet, and phrases do not
+ * overlap.
+ *
+ * Interrupt. avatarforcing_session_interrupt (barge-in) drops the phrase
+ * audio from a frame on; from there the frames are idle. Blocks that are
+ * already computed do not change; drop their frames in the caller for a
+ * hard cut. There is no cross-fade, as in the live app: the model moves the
+ * face from speech to idle within the next block.
+ *
+ * Backpressure. At most live_queue_blocks blocks of frames wait for pull
+ * (ready, or still in the decoder thread). When the next block does not fit,
+ * step computes nothing and returns AVATARFORCING_LIVE_QUEUE_FULL; the clock
+ * of the session does not move. Pull frames, then step again. Nothing is
+ * dropped.
+ *
+ * Threads. step and push_phrase take the context lock: they run one at a
+ * time, from any thread. push_phrase computes wav2vec2, so a step waits for
+ * a push that runs. interrupt, frames_ready, pull_frames and stats_json do
+ * not take the context lock; call them from any thread at any time, but
+ * not pull_frames from two threads at once. avatarforcing_cancel makes the
+ * next step fail; the session stays failed. A push_phrase that has started
+ * (also one that waits for the lock) when an interrupt comes returns
+ * AVATARFORCING_LIVE_DROPPED.
+ *
+ * Not in live mode yet: the reanchor (a fresh primer every 112 blocks),
+ * which the live app needs for calls of more than about a minute. */
+
+/* step: the frame queue is full; nothing was computed. */
+#define AVATARFORCING_LIVE_QUEUE_FULL (-2)
+/* push_phrase: an interrupt came after the call started; the phrase is
+ * dropped. */
+#define AVATARFORCING_LIVE_DROPPED (-3)
+
+/* Adds one phrase of mono float PCM (any sample rate). at_frame < 0: the
+ * phrase starts right after the last phrase, or at the next block when no
+ * phrase is pending. at_frame >= 0: the phrase starts at that frame, or
+ * later when that frame is computed already or is inside an earlier phrase.
+ * Returns the start frame, AVATARFORCING_LIVE_DROPPED, or -1 on error. An
+ * error in the call (no samples, a phrase that ends after
+ * live_max_ahead_seconds) leaves the session as it was; a failed wav2vec2
+ * fails the session. */
+AVATARFORCING_API int64_t avatarforcing_session_push_phrase(avatarforcing_session* s, const float* pcm,
+                                                            int n_samples, int sample_rate, int64_t at_frame);
+
+/* Computes the next block of block_frames frames. Returns the index of its
+ * first frame, AVATARFORCING_LIVE_QUEUE_FULL, or -1 on error (the session
+ * failed). With overlap the frames are ready later; without it they are
+ * ready when step returns. */
+AVATARFORCING_API int64_t avatarforcing_session_step(avatarforcing_session* s);
+
+/* Barge-in: drops the phrase audio from frame at_frame on (at_frame < 0:
+ * from the next block on). Frames that a step has computed already keep
+ * their features, so the cut is at max(at_frame, next block). Returns the
+ * first frame that is idle, or -1 when s is not a live session. Does not
+ * wait for a running step. */
+AVATARFORCING_API int64_t avatarforcing_session_interrupt(avatarforcing_session* s, int64_t at_frame);
+
+/* A JSON object with the state of a live session:
+ *   {"next_frame":40,"speech_end":115,"pending_phrases":1,
+ *    "queued_frames":10,"ready_frames":10,"queue_frames":30,"blocks":4,
+ *    "speech_blocks":1,"queue_full":0,"phrases":1,"dropped_phrases":0,
+ *    "interrupts":0,"last_step_ms":350.2,"max_step_ms":410.0}
+ * next_frame: the first frame of the next step. speech_end: the end of the
+ * last phrase (next_frame when none is pending). queued_frames: frames that
+ * wait for pull, ready or in the decoder. Free the string with
+ * avatarforcing_free_string. NULL on error. */
+AVATARFORCING_API char* avatarforcing_session_stats_json(avatarforcing_session* s);
 
 #ifdef __cplusplus
 }

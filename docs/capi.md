@@ -75,6 +75,10 @@ context with `"backend": "cuda"`.
 | `avatarforcing_session_frames_ready` | number of frames ready to pull |
 | `avatarforcing_session_pull_frames` | copy ready frames to a caller buffer |
 | `avatarforcing_session_close` | release a session |
+| `avatarforcing_session_push_phrase` | live mode: add one phrase; returns its start frame |
+| `avatarforcing_session_step` | live mode: compute the next block (speech or idle) |
+| `avatarforcing_session_interrupt` | live mode: barge-in; idle from a frame on |
+| `avatarforcing_session_stats_json` | live mode: frame clock, queue and counters |
 
 The header documents each function.
 
@@ -107,6 +111,18 @@ Request options go to the generate functions and to
 
 The options map to the CLI options of the same names (`docs/cli.md`).
 The frame rate is not an option: it comes from the GGUF (25 fps).
+
+Session options go to `avatarforcing_session_open` only, beside the request
+options:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `live` | bool | false | open a live session (see "Live mode") |
+| `live_queue_blocks` | int | 3 | live: blocks of frames that may wait for pull, 1 to 1000 |
+| `live_max_ahead_seconds` | int | 30 | live: a phrase must end at most this far after the next block |
+
+In a live session `audio_mode` defaults to `raw`, as in the upstream live
+app, unless the request or the context options set it.
 
 ## Offline generation
 
@@ -187,22 +203,128 @@ ready later. Another thread can call `frames_ready` and `pull_frames` while
 `push_pcm` or `flush` runs. Without `overlap`, `push_pcm` returns when the
 frames are ready.
 
-### Not implemented yet
+## Live mode
 
-The session is the base for real-time use. These parts of the upstream live
-app (`docs/cli.md`) are not in it yet:
+A live session drives the face for as long as a call lasts, as the
+upstream live app (`voicechat/avatar_worker.py` of AvatarVoice) does. Open
+it with `{"live": true}`. Then:
 
-- Idle frames. When no audio arrives, the live app feeds pink-noise idle
-  features (`audio.idle_pcm` in the GGUF), so the avatar keeps moving. A
-  session now waits for audio.
-- Reanchor. The live app re-runs the primer every 112 blocks once idle and
-  crossfades over 25 frames. A session has no length limit, but it does not
-  reset its cache.
-- A hidden primer. The live app does not show the 50 primer frames. A
-  session outputs them, as the offline path does.
+1. Call `avatarforcing_session_step` once per block: 10 frames, 400 ms of
+   video at 25 fps. Each call computes exactly one block.
+2. Add each TTS phrase with `avatarforcing_session_push_phrase` when it
+   arrives. It returns the frame where the phrase starts.
+3. Pull the frames with `avatarforcing_session_pull_frames`.
+4. On barge-in, call `avatarforcing_session_interrupt`.
+5. Close the session with `avatarforcing_session_close`. A live session
+   has no flush.
 
-These change the frames that a session outputs, so they will come with a
-new ABI version or new functions.
+```c
+avatarforcing_session* s = avatarforcing_session_open(ctx, "portrait512.png",
+                                                      "{\"live\": true}");
+/* when a phrase arrives (any thread) */
+int64_t start = avatarforcing_session_push_phrase(s, pcm, n, 24000, -1);
+/* play the phrase audio from frame `start` on */
+
+/* every 400 ms, a little before the block is due */
+int64_t first = avatarforcing_session_step(s);
+if (first == AVATARFORCING_LIVE_QUEUE_FULL) { /* pull, then step again */ }
+int got = avatarforcing_session_pull_frames(s, buf, 10);
+
+/* the user starts to speak */
+int64_t idle_from = avatarforcing_session_interrupt(s, playback_frame);
+```
+
+### Clock
+
+The library has no timer and reads no clock. The caller owns the clock: it
+calls `step` when the next block is due, minus the time a step takes plus a
+margin. If the caller is ahead, it
+sleeps. Frame indices are `int64_t` and count from 0. Frame `f` is due at
+`f / 25` s after frame 0. The frames of a session come out in order, 10 per
+step, with no gap. The library is deterministic: the same portrait, phrases,
+call order, start frames and seed give the same frames.
+
+`step` gives each frame of its block the features of the phrase that covers
+the frame (lip-sync). A frame that no phrase covers gets the idle
+features: wav2vec2 on the 5 s of pink-noise room tone in the GGUF
+(`audio.idle_pcm`), the features that the live app uses. Zero features make
+the mouth move, so the idle features are not zeros. Frame `f` takes idle
+row `(f + 50) mod 125`. So the idle features run as one continuous stream,
+and a frame has the same features in every block that reads it (a block
+reads 2 frames of context and its 10 new frames).
+
+### Hidden primer
+
+The model starts with a primer of 50 frames. The live app runs it once on
+idle features, writes the caches and does not decode or show its frames.
+A live session does the same in `avatarforcing_session_open`: the primer
+covers frames -50 to -1 and nobody sees them. The first `step` gives
+frame 0. So `session_open` costs a primer (151 ms on an NVIDIA Thor at nfe
+6, `docs/gpu.md`) and the first frames come after one more step.
+
+### Phrases
+
+`push_phrase` runs wav2vec2 on the whole phrase, as the live app does. The
+live app measured that features of rolling windows match the whole-phrase
+features badly, so a phrase must be a whole utterance, for example one TTS
+sentence. The phrase then starts:
+
+- with `at_frame < 0`: right after the last phrase, or at the next block
+  when no phrase is pending (the live app does this);
+- with `at_frame >= 0`: at that frame, or later when a step has computed
+  that frame already, or when an earlier phrase covers it.
+
+Phrases never overlap. The return value is the start frame: play the
+phrase audio from that frame on, on the same clock as the frames. A phrase
+that would end more than `live_max_ahead_seconds` after the next block
+fails with -1. It does not change the session.
+
+### Interrupt
+
+`avatarforcing_session_interrupt(s, at_frame)` drops the phrase audio from
+`at_frame` on: phrases that start there or later go, and the phrase that
+runs over `at_frame` is cut there. From that frame on, `step` uses idle
+features. Frames that a step has computed already do not change, so the
+cut is at `max(at_frame, next block)`, and the function returns that frame.
+Up to `live_queue_blocks` blocks can be computed ahead of playback. Those
+frames still show the speech. To cut them too, drop them in the caller.
+The live app lets them play out. There is no
+cross-fade, as in the live app: within the next block the model moves the
+face from speech to idle.
+
+`interrupt` does not wait for a running `step` or `push_phrase`. A
+`push_phrase` that has started when the interrupt comes, also one that
+waits for the context lock, returns `AVATARFORCING_LIVE_DROPPED` (-3) and
+places nothing. This is what the live app does with phrases in its wav2vec2
+queue.
+
+### Backpressure
+
+At most `live_queue_blocks` blocks of frames wait for pull. That counts
+the frames that are ready and the frames still in the decoder thread. When
+the next block does not fit, `step` computes nothing and returns
+`AVATARFORCING_LIVE_QUEUE_FULL` (-2). The frame clock of the session does
+not move and nothing is dropped. Pull frames, then call `step` again. A
+caller that stops pulling thus stops the session after
+`live_queue_blocks` blocks, with bounded memory (3 blocks at 512x512 are
+23 MB).
+
+`avatarforcing_session_stats_json` gives the next frame, the end of the
+scheduled speech, the queued frames, the number of steps and of steps with
+speech, the queue-full count, the phrases, the dropped phrases, the
+interrupts, and the time of the last and the slowest step.
+
+### Not in live mode yet
+
+- **Reanchor.** The live app re-runs the primer every 112 blocks (about
+  45 s) when it is idle, or after 162 blocks at the latest, and
+  cross-fades over 25 frames. Without it the quality drifts after about a
+  minute. The schedule keeps the features of the last 50 frames for it.
+- **Skip ahead.** When the live app falls behind, it moves its block
+  clock forward. A live session computes every block in order; a caller
+  that falls behind gets late frames.
+- Different user video or audio: the user inputs are zeros, as in the live
+  app with `u_cfg_scale = 0`.
 
 ## Threads
 
@@ -218,6 +340,15 @@ new ABI version or new functions.
 - `avatarforcing_session_frames_ready` and
   `avatarforcing_session_pull_frames` do not wait for the lock either. Do not
   call `pull_frames` from two threads at the same time.
+- In live mode, `step` and `push_phrase` take the lock: they run one at a
+  time, from any threads. `push_phrase` runs wav2vec2 on the model device,
+  so a `step` waits for a `push_phrase` that runs, and the other way round.
+  `interrupt` and `stats_json` do not wait for the lock. A Go program can
+  thus run `step` on a ticker goroutine, `push_phrase` on the TTS goroutine,
+  `interrupt` on the VAD goroutine and `pull_frames` on the encoder
+  goroutine.
+- `avatarforcing_cancel` makes the next `step` of a live session fail, and
+  the session stays failed. Use `interrupt` for barge-in.
 - `avatarforcing_last_error` returns a pointer into the context. The next
   failing call on the context overwrites it, so copy the message before you
   make that call.
@@ -243,7 +374,31 @@ portrait and a 2.5 s WAV file to the current directory, then:
 - runs the same audio through a session and checks that the frames are the
   same as the offline frames.
 
+`tests/test_capi_live.c` tests live mode. It needs `AVATARFORCING_TEST_GGUF`
+too. It runs one call of 150 frames twice:
+
+- the queue bound: 3 steps without a pull, then
+  `AVATARFORCING_LIVE_QUEUE_FULL`, with the clock unchanged;
+- phrase placement: a start frame, an append, a start inside an earlier
+  phrase, and a phrase too far ahead;
+- an interrupt, and an interrupt while a push waits for the lock (the
+  push is dropped);
+- that idle frames are stable;
+- that the two runs give the same frames;
+- that an offline clip gives the same frames before and after the live
+  sessions.
+
+With `AVATARFORCING_TEST_PORTRAIT` (a real face) it also checks that the
+mouth moves more in the phrases than when idle.
+`AVATARFORCING_TEST_WAV` gives it real speech (16-bit or float WAV, at
+least 3.6 s). `AVATARFORCING_TEST_OVERLAP=1` runs it with the decoder
+thread. `tests/test_live_schedule.cpp` tests the feature schedule of
+live mode and needs no model.
+
 ```sh
 AVATARFORCING_TEST_GGUF=avatarforcing-f32.gguf \
 ctest --test-dir build -R test_capi --output-on-failure
+AVATARFORCING_TEST_GGUF=avatarforcing-f32.gguf \
+AVATARFORCING_TEST_PORTRAIT=portrait512.png AVATARFORCING_TEST_WAV=speech.wav \
+ctest --test-dir build -R test_capi_live --output-on-failure
 ```

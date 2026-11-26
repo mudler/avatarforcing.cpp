@@ -6,6 +6,7 @@
 
 #include "audio_io.hpp"
 #include "common.hpp"
+#include "live.hpp"
 #include "pipeline.hpp"
 
 #include <atomic>
@@ -27,6 +28,7 @@ struct avatarforcing_ctx {
     std::mutex mu;   // one call at a time on the engine
     af::Engine engine;
     af::GenOptions defaults;
+    bool defaults_audio_mode = false;   // the context options set audio_mode
     std::string ffmpeg = "ffmpeg";
     std::mutex err_mu;
     std::string last_error;
@@ -36,7 +38,8 @@ struct avatarforcing_ctx {
 
 struct avatarforcing_session {
     avatarforcing_ctx* ctx = nullptr;
-    std::unique_ptr<af::Generator> gen;
+    std::unique_ptr<af::Generator> gen;     // a session that follows the audio
+    std::unique_ptr<af::LiveSession> live;  // or a live session ("live": true)
     size_t frame_bytes = 0;
     std::mutex qmu;
     std::deque<std::vector<uint8_t>> ready;   // guarded by qmu
@@ -284,14 +287,50 @@ bool apply_request_option(const std::string& k, const JsonValue& v, af::GenOptio
     return true;
 }
 
-bool request_options(avatarforcing_ctx* ctx, const char* json, af::GenOptions& g, std::string& err) {
+// Session options of avatarforcing_session_open, beside the request options.
+struct SessionOptions {
+    bool live = false;
+    af::LiveOptions lo;
+    bool audio_mode_set = false;   // the request or the context set audio_mode
+};
+
+// session: NULL for the generate functions, where the session keys are unknown.
+bool request_options(avatarforcing_ctx* ctx, const char* json, af::GenOptions& g, std::string& err,
+                     SessionOptions* session = nullptr) {
     g = ctx->defaults;
+    if (session) session->audio_mode_set = ctx->defaults_audio_mode;
     JsonObject obj;
     if (!parse_options(json, obj, err)) return false;
+    bool live_keys = false;
     for (auto& kv : obj) {
+        const std::string& k = kv.first;
+        long long i = 0;
+        if (session && k == "live") {
+            if (!as_bool(k, kv.second, session->live, err)) return false;
+            continue;
+        }
+        if (session && k == "live_queue_blocks") {
+            if (!as_int(k, kv.second, i, err)) return false;
+            if (i < 1 || i > 1000) { err = "option \"live_queue_blocks\" must be 1 to 1000"; return false; }
+            session->lo.queue_blocks = (int)i;
+            live_keys = true;
+            continue;
+        }
+        if (session && k == "live_max_ahead_seconds") {
+            if (!as_int(k, kv.second, i, err)) return false;
+            if (i < 1 || i > 86400) { err = "option \"live_max_ahead_seconds\" must be 1 to 86400"; return false; }
+            session->lo.max_ahead_seconds = (int)i;
+            live_keys = true;
+            continue;
+        }
         bool handled = false;
-        if (!apply_request_option(kv.first, kv.second, g, handled, err)) return false;
-        if (!handled) { err = "unknown request option \"" + kv.first + "\""; return false; }
+        if (!apply_request_option(k, kv.second, g, handled, err)) return false;
+        if (!handled) { err = "unknown request option \"" + k + "\""; return false; }
+        if (session && k == "audio_mode") session->audio_mode_set = true;
+    }
+    if (session && !session->live && live_keys) {
+        err = "the live_* options need \"live\": true";
+        return false;
     }
     return true;
 }
@@ -455,6 +494,7 @@ avatarforcing_ctx* avatarforcing_load(const char* gguf_path, const char* options
             af::EngineOptions eo;
             af::GenOptions defaults;
             std::string ffmpeg = "ffmpeg";
+            bool audio_mode_set = false;
             bool ok = parse_options(options_json, obj, err);
             for (size_t i = 0; ok && i < obj.size(); ++i) {
                 const std::string& k = obj[i].first;
@@ -481,11 +521,13 @@ avatarforcing_ctx* avatarforcing_load(const char* gguf_path, const char* options
                 } else {
                     ok = apply_request_option(k, v, defaults, handled, err);
                     if (ok && !handled) { err = "unknown option \"" + k + "\""; ok = false; }
+                    if (ok && k == "audio_mode") audio_mode_set = true;
                 }
             }
             if (ok) {
                 std::unique_ptr<avatarforcing_ctx> c(new avatarforcing_ctx());
                 c->defaults = defaults;
+                c->defaults_audio_mode = audio_mode_set;
                 c->ffmpeg = ffmpeg;
                 if (c->engine.load(gguf_path, eo, err)) ctx = c.release();
             }
@@ -507,7 +549,10 @@ void avatarforcing_free(avatarforcing_ctx* ctx) {
     {
         std::lock_guard<std::mutex> lk(ctx->mu);
         s = ctx->session;
-        if (s) s->gen.reset();
+        if (s) {
+            s->gen.reset();
+            s->live.reset();
+        }
         ctx->session = nullptr;
     }
     delete s;
@@ -618,13 +663,29 @@ avatarforcing_session* avatarforcing_session_open(avatarforcing_ctx* ctx, const 
         if (ctx->session) { set_error(ctx, "a session is already open on this context"); return -1; }
         if (!portrait_path) { set_error(ctx, "no portrait path"); return -1; }
         af::GenOptions go;
-        if (!request_options(ctx, request_json, go, err)) { set_error(ctx, err); return -1; }
+        SessionOptions so;
+        if (!request_options(ctx, request_json, go, err, &so)) { set_error(ctx, err); return -1; }
         af::Engine& e = ctx->engine;
         std::vector<float> image;
         if (!af::load_portrait(portrait_path, e.size(), image, err)) { set_error(ctx, err); return -1; }
         std::unique_ptr<avatarforcing_session> s(new avatarforcing_session());
         s->ctx = ctx;
         s->frame_bytes = (size_t)e.size() * e.size() * 3;
+        if (so.live) {
+            // The live app feeds raw PCM to wav2vec2 (no per-phrase
+            // normalization); it is the live default.
+            if (!so.audio_mode_set) go.normalized = false;
+            s->normalized = go.normalized;
+            s->live.reset(new af::LiveSession(e, go, so.lo, &ctx->cancel));
+            if (!s->live->open(image.data(), err)) {
+                s->live.reset();
+                set_error(ctx, err);
+                return -1;
+            }
+            ctx->session = s.get();
+            out = s.release();
+            return 0;
+        }
         s->normalized = go.normalized;
         avatarforcing_session* sp = s.get();
         auto sink = [sp](const uint8_t* rgb, int n, std::string&) -> bool {
@@ -652,6 +713,7 @@ int avatarforcing_session_push_pcm(avatarforcing_session* s, const float* pcm, i
     return guarded(ctx, [&] {
         std::lock_guard<std::mutex> lk(ctx->mu);
         af::clear_last_log();
+        if (s->live) { set_error(ctx, "a live session takes phrases with avatarforcing_session_push_phrase"); return -1; }
         if (!s->gen) { set_error(ctx, "the session is closed"); return -1; }
         if (s->failed) { set_error(ctx, "the session failed earlier"); return -1; }
         if (s->flushed) { set_error(ctx, "the session audio has ended (flush was called)"); return -1; }
@@ -687,6 +749,7 @@ int avatarforcing_session_flush(avatarforcing_session* s) {
     return guarded(ctx, [&] {
         std::lock_guard<std::mutex> lk(ctx->mu);
         af::clear_last_log();
+        if (s->live) { set_error(ctx, "a live session has no flush; close it"); return -1; }
         if (!s->gen) { set_error(ctx, "the session is closed"); return -1; }
         if (s->failed) { set_error(ctx, "the session failed earlier"); return -1; }
         if (s->flushed) return 0;
@@ -703,6 +766,7 @@ int avatarforcing_session_flush(avatarforcing_session* s) {
 
 int avatarforcing_session_frames_ready(avatarforcing_session* s) {
     if (!s) return -1;
+    if (s->live) return s->live->frames_ready();
     std::lock_guard<std::mutex> qlk(s->qmu);
     return (int)s->ready.size();
 }
@@ -711,6 +775,12 @@ int avatarforcing_session_pull_frames(avatarforcing_session* s, uint8_t* dst, in
     if (!s) return -1;
     avatarforcing_ctx* ctx = s->ctx;
     if (!dst || max_frames < 0) { set_error(ctx, "invalid frame buffer"); return -1; }
+    if (s->live) {
+        const int n = s->live->pull(dst, max_frames);
+        std::string err;
+        if (n < 0 && s->live->failed(&err)) set_error(ctx, err);
+        return n;
+    }
     std::deque<std::vector<uint8_t>> got;
     {
         std::lock_guard<std::mutex> qlk(s->qmu);
@@ -732,6 +802,69 @@ int avatarforcing_session_pull_frames(avatarforcing_session* s, uint8_t* dst, in
     return (int)got.size();
 }
 
+// ---------------------------------------------------------------------------
+// live mode
+
+int64_t avatarforcing_session_push_phrase(avatarforcing_session* s, const float* pcm, int n_samples,
+                                          int sample_rate, int64_t at_frame) {
+    if (!s) return -1;
+    avatarforcing_ctx* ctx = s->ctx;
+    // An interrupt from now on drops this phrase, also while the call waits
+    // for the context lock.
+    const uint64_t epoch = s->live ? s->live->epoch() : 0;
+    int64_t out = -1;
+    guarded(ctx, [&] {
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        af::clear_last_log();
+        if (!s->live) { set_error(ctx, "not a live session (open it with \"live\": true)"); return -1; }
+        if (n_samples <= 0 || !pcm) { set_error(ctx, "invalid PCM buffer"); return -1; }
+        if (sample_rate <= 0) { set_error(ctx, "invalid sample rate " + std::to_string(sample_rate)); return -1; }
+        af::Engine& e = ctx->engine;
+        std::vector<float> x(pcm, pcm + n_samples);
+        if (sample_rate != e.sample_rate()) x = af::resample(x, sample_rate, e.sample_rate());
+        std::string err;
+        out = s->live->push_phrase(x.data(), x.size(), at_frame, epoch, err);
+        if (out == -1) set_error(ctx, err);
+        return 0;
+    });
+    return out;
+}
+
+int64_t avatarforcing_session_step(avatarforcing_session* s) {
+    if (!s) return -1;
+    avatarforcing_ctx* ctx = s->ctx;
+    int64_t out = -1;
+    guarded(ctx, [&] {
+        std::lock_guard<std::mutex> lk(ctx->mu);
+        af::clear_last_log();
+        if (!s->live) { set_error(ctx, "not a live session (open it with \"live\": true)"); return -1; }
+        std::string err;
+        out = s->live->step(err);
+        if (out == -1) set_error(ctx, err);
+        return 0;
+    });
+    return out;
+}
+
+int64_t avatarforcing_session_interrupt(avatarforcing_session* s, int64_t at_frame) {
+    if (!s) return -1;
+    avatarforcing_ctx* ctx = s->ctx;
+    if (!s->live) { set_error(ctx, "not a live session (open it with \"live\": true)"); return -1; }
+    return s->live->interrupt(at_frame);
+}
+
+char* avatarforcing_session_stats_json(avatarforcing_session* s) {
+    if (!s) return nullptr;
+    avatarforcing_ctx* ctx = s->ctx;
+    if (!s->live) { set_error(ctx, "not a live session (open it with \"live\": true)"); return nullptr; }
+    char* out = nullptr;
+    guarded(ctx, [&] {
+        out = dup_string(s->live->stats_json());
+        return out ? 0 : -1;
+    });
+    return out;
+}
+
 void avatarforcing_session_close(avatarforcing_session* s) {
     if (!s) return;
     avatarforcing_ctx* ctx = s->ctx;
@@ -739,6 +872,7 @@ void avatarforcing_session_close(avatarforcing_session* s) {
         std::lock_guard<std::mutex> lk(ctx->mu);
         try {
             s->gen.reset();   // stops the decoder and output threads
+            s->live.reset();
         } catch (...) {
         }
         if (ctx->session == s) ctx->session = nullptr;
