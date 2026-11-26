@@ -592,6 +592,10 @@ bool VideoWriter::open(const std::string& ffmpeg, const std::string& out_path, c
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
         out_path};
+    if (audio_path.empty())
+        argv_s = {ffmpeg, "-y", "-loglevel", "error",
+                  "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", size, "-r", rate, "-i", "-",
+                  "-c:v", "libx264", "-pix_fmt", "yuv420p", out_path};
     std::vector<char*> argv;
     for (auto& s : argv_s) argv.push_back(const_cast<char*>(s.c_str()));
     argv.push_back(nullptr);
@@ -644,6 +648,26 @@ bool VideoWriter::close(std::string& err) {
         pid_ = -1;
     }
     return ok;
+}
+
+bool mux_audio(const std::string& ffmpeg, const std::string& video_path, const std::string& audio_path,
+               const std::string& out_path, std::string& err) {
+    std::vector<std::string> argv_s = {ffmpeg, "-y", "-loglevel", "error", "-i", video_path, "-i", audio_path,
+                                       "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                                       "-shortest", out_path};
+    std::vector<char*> argv;
+    for (auto& s : argv_s) argv.push_back(const_cast<char*>(s.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    const int rc = posix_spawnp(&pid, ffmpeg.c_str(), nullptr, nullptr, argv.data(), environ);
+    if (rc != 0) { err = "cannot start " + ffmpeg + ": " + std::strerror(rc); return false; }
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
+        err = "ffmpeg failed to mux " + audio_path + " (status " + std::to_string(st) + ")";
+        return false;
+    }
+    return true;
 }
 
 } // namespace af

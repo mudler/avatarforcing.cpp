@@ -238,7 +238,8 @@ private:
 class VideoWriter {
 public:
     ~VideoWriter();
-    // ffmpeg: program name (looked up on PATH) or path.
+    // ffmpeg: program name (looked up on PATH) or path. audio_path "": an
+    // mp4 with video only.
     bool open(const std::string& ffmpeg, const std::string& out_path, const std::string& audio_path, int w, int h,
               int fps, std::string& err);
     bool write(const uint8_t* frames, int n, std::string& err);   // [n, h, w, 3]
@@ -251,5 +252,9 @@ private:
     int fd_ = -1;
     pid_t pid_ = -1;
 };
+
+// Copies the video of video_path and adds audio_path as AAC (-shortest).
+bool mux_audio(const std::string& ffmpeg, const std::string& video_path, const std::string& audio_path,
+               const std::string& out_path, std::string& err);
 
 } // namespace af

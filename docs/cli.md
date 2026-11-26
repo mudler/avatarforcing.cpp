@@ -9,6 +9,8 @@ backend (`docs/gpu.md`) and calls `ffmpeg` to encode the mp4. The C API
 avatarforcing-cli --model avatarforcing-f32.gguf --portrait portrait512.png \
     --audio speech.wav -o out.mp4
 avatarforcing-cli info avatarforcing-f32.gguf
+avatarforcing-cli --model avatarforcing-f32.gguf --portrait portrait512.png \
+    --live call.txt -o call.mp4
 ```
 
 ## Options
@@ -18,6 +20,7 @@ avatarforcing-cli info avatarforcing-f32.gguf
 | `--model PATH` | required | the avatarforcing GGUF |
 | `--portrait PATH` | required | square face image at the model size (512x512), PNG, JPEG or BMP |
 | `--audio PATH` | required | speech WAV: any sample rate, any channel count, PCM or float |
+| `--live SCRIPT` | | live mode instead of `--audio`: simulates a live call (see "Live mode") |
 | `-o`, `--output PATH` | | mp4 output (H.264 video, AAC audio); needs `ffmpeg` on `PATH` |
 | `--frames-dir DIR` | | also writes every frame as `DIR/frame_NNNNN.png` |
 | `--nfe N` | GGUF `sampler.default_nfe` (6) | number of sampler time points; N - 1 denoising forwards per block |
@@ -31,6 +34,8 @@ avatarforcing-cli info avatarforcing-f32.gguf
 | `--decode-batch N` | 1 on the CPU, 10 on a GPU | frames per decoder graph (0: a whole block) |
 | `--overlap`, `--no-overlap` | on for a GPU | decode block N in a second thread while the sampler computes block N + 1; on CUDA the sampler then runs on high-priority streams |
 | `--profile` | off | per-op time profile of the decoder graphs (node by node, slow) |
+| `--realtime` | off | live mode: steps on the wall clock, one block every 400 ms, and counts the late blocks |
+| `--queue-blocks N` | 3 | live mode: blocks that may wait for the writer |
 
 Give `-o`, `--frames-dir` or both. At the end the tool prints the time of
 each stage, the sampler and decoder time of a steady block and the period
@@ -119,8 +124,9 @@ The video has `max(50, T)` frames. When the audio is shorter than 2 s,
 
 ### Differences in the live app (`voicechat/avatar_worker.py`)
 
-The live app runs the same model in a different loop. The CLI does not
-implement these:
+The live app runs the same model in a different loop. The offline mode of
+the CLI does not implement these. Live mode (`--live`, next section)
+implements all of them except the reanchor:
 
 - wav2vec2 runs per TTS phrase on the raw PCM (`--audio-mode raw`): no
   normalization, zero padding, `max(1, ceil(samples / 640))` frames.
@@ -131,6 +137,40 @@ implement these:
   latest, the app re-runs a primer to reset the cache (reanchor) and
   crossfades over 25 frames.
 - The video length follows the session, not the audio length.
+
+## Live mode
+
+`--live SCRIPT` simulates a live call on a live session of the library
+(`docs/capi.md`, "Live mode"). The script lists timed events, one per line:
+
+```
+# seconds  event  [WAV file]
+4.0   say        hello.wav
+9.0   say        answer.wav
+11.0  interrupt
+14.0  end
+```
+
+- `say` pushes the WAV as one phrase that starts at that time. A relative
+  path is relative to the script.
+- `interrupt` is a barge-in at that time: the phrase audio stops there and
+  the face goes idle.
+- `end` ends the call. Without it, the call ends 2 s after the last event.
+
+Time 0 is frame 0, the first frame after the hidden primer. The tool steps
+one block (10 frames, 400 ms) at a time. Before each step it sends the
+events whose frame is in that block, as a caller that runs one block ahead
+of playback does. So a phrase starts at its exact frame, unless it would
+overlap an earlier phrase. In that case it starts at the end of the earlier
+phrase, and the tool prints the frame where it starts.
+
+The mp4 has the frames of the whole call. Its audio track holds each phrase
+at its start frame, cut at the interrupts. wav2vec2 gets the raw PCM
+(`--audio-mode raw`) unless `--audio-mode` says otherwise. At the end the
+tool prints the step time per block, for idle blocks and for blocks with
+speech, and the session statistics. With `--realtime` it waits for the time
+of each block, as a live caller does, and counts the blocks that were not
+ready in time.
 
 ## End-to-end gate
 

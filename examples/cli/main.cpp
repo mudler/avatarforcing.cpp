@@ -8,6 +8,7 @@
 #include "audio_io.hpp"
 #include "backend.hpp"
 #include "flow.hpp"
+#include "live.hpp"
 #include "pipeline.hpp"
 
 #include "ggml.h"
@@ -24,7 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/resource.h>
@@ -53,6 +57,11 @@ struct Args {
     int decode_batch = -1;     // < 0: 1 on the CPU, a whole block elsewhere
     bool profile = false;
     int overlap = -1;          // < 0: on for a GPU backend, off on the CPU
+    bool normalized_set = false;
+    // live mode
+    std::string live_script;
+    bool realtime = false;     // pace the steps on the wall clock
+    int queue_blocks = 3;
 };
 
 void usage(const char* prog) {
@@ -60,6 +69,7 @@ void usage(const char* prog) {
         "usage:\n"
         "  %s --model MODEL.gguf --portrait IMG --audio WAV [-o OUT.mp4] [options]\n"
         "  %s info --model MODEL.gguf\n"
+        "  %s --model MODEL.gguf --portrait IMG --live SCRIPT [-o OUT.mp4] [options]\n"
         "\n"
         "inputs:\n"
         "  --model PATH          avatarforcing GGUF\n"
@@ -67,6 +77,8 @@ void usage(const char* prog) {
         "                        PNG, JPEG or BMP; no face detection is done\n"
         "  --audio PATH          speech WAV, any rate and channel count (mixed to mono,\n"
         "                        resampled to 16 kHz)\n"
+        "  --live SCRIPT         live mode instead of --audio: simulate a live call from\n"
+        "                        a script of timed events (docs/cli.md, \"Live mode\")\n"
         "outputs (at least one):\n"
         "  -o, --output PATH     mp4 (H.264 + AAC) written by ffmpeg, which must be on PATH\n"
         "  --frames-dir DIR      also write every frame as DIR/frame_NNNNN.png\n"
@@ -88,8 +100,12 @@ void usage(const char* prog) {
         "                        graphs node by node; slow)\n"
         "  --overlap, --no-overlap\n"
         "                        decode block N while the sampler computes block N + 1\n"
-        "                        (default: on for a GPU backend)\n",
-        prog, prog);
+        "                        (default: on for a GPU backend)\n"
+        "live mode:\n"
+        "  --realtime            step on the wall clock, one block every 400 ms, and count\n"
+        "                        the late blocks (default: step as fast as possible)\n"
+        "  --queue-blocks N      blocks that may wait for the writer (default 3)\n",
+        prog, prog, prog);
 }
 
 bool parse_args(int argc, char** argv, Args& a) {
@@ -120,9 +136,13 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--overlap") a.overlap = 1;
         else if (k == "--no-overlap") a.overlap = 0;
         else if (k == "--max-seconds") { if (!(v = val("--max-seconds"))) return false; a.max_seconds = std::atoi(v); }
+        else if (k == "--live") { if (!(v = val("--live"))) return false; a.live_script = v; }
+        else if (k == "--realtime") a.realtime = true;
+        else if (k == "--queue-blocks") { if (!(v = val("--queue-blocks"))) return false; a.queue_blocks = std::atoi(v); }
         else if (k == "--audio-mode") {
             if (!(v = val("--audio-mode"))) return false;
             const std::string m = v;
+            a.normalized_set = true;
             if (m == "normalized") a.normalized = true;
             else if (m == "raw") a.normalized = false;
             else { std::fprintf(stderr, "error: --audio-mode must be normalized or raw\n"); return false; }
@@ -377,6 +397,244 @@ int run_generate(const Args& a) {
     return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// live mode: a simulated call
+
+struct LiveEvent {
+    double t = 0;          // seconds after frame 0
+    std::string kind;      // say, interrupt, end
+    std::string path;      // say: the WAV file
+    int line = 0;
+};
+
+// Script lines: "<seconds> say <wav>", "<seconds> interrupt", "<seconds> end".
+// '#' starts a comment. A relative WAV path is relative to the script.
+bool read_script(const std::string& path, std::vector<LiveEvent>& ev, std::string& err) {
+    std::ifstream f(path);
+    if (!f) { err = "cannot open " + path; return false; }
+    std::string dir;
+    const size_t slash = path.rfind('/');
+    if (slash != std::string::npos) dir = path.substr(0, slash + 1);
+    std::string line;
+    int no = 0;
+    while (std::getline(f, line)) {
+        ++no;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        std::istringstream in(line);
+        LiveEvent e;
+        if (!(in >> e.t)) {
+            std::string rest;
+            if (std::istringstream(line) >> rest) { err = path + ":" + std::to_string(no) + ": expected a time"; return false; }
+            continue;
+        }
+        e.line = no;
+        if (!(in >> e.kind) || (e.kind != "say" && e.kind != "interrupt" && e.kind != "end")) {
+            err = path + ":" + std::to_string(no) + ": expected say, interrupt or end";
+            return false;
+        }
+        if (e.kind == "say") {
+            if (!(in >> e.path)) { err = path + ":" + std::to_string(no) + ": say needs a WAV file"; return false; }
+            if (e.path[0] != '/') e.path = dir + e.path;
+        }
+        if (e.t < 0) { err = path + ":" + std::to_string(no) + ": negative time"; return false; }
+        ev.push_back(e);
+    }
+    std::stable_sort(ev.begin(), ev.end(), [](const LiveEvent& x, const LiveEvent& y) { return x.t < y.t; });
+    return true;
+}
+
+int run_live(const Args& a) {
+    if (a.model.empty() || a.portrait.empty()) {
+        std::fprintf(stderr, "error: --model, --portrait and --live are required\n");
+        return 2;
+    }
+    if (a.output.empty() && a.frames_dir.empty()) {
+        std::fprintf(stderr, "error: give -o OUT.mp4 and/or --frames-dir DIR\n");
+        return 2;
+    }
+    std::string err;
+    std::vector<LiveEvent> events;
+    if (!read_script(a.live_script, events, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+
+    af::EngineOptions eo;
+    eo.backend = a.backend;
+    eo.threads = a.threads;
+    eo.decode_batch = a.decode_batch;
+    eo.overlap = a.overlap;
+    af::Engine engine;
+    if (!engine.load(a.model, eo, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    const int fps = engine.fps(), S = engine.size(), sr = engine.sample_rate();
+    const int nb = (int)engine.flow().config().block_frames;
+    const int spf = sr / fps;   // samples per frame (640)
+
+    // The call ends at the "end" event, or 2 s after the last event.
+    double t_end = events.empty() ? 4.0 : events.back().t + 2.0;
+    for (const LiveEvent& e : events)
+        if (e.kind == "end") { t_end = e.t; break; }
+    const int64_t end_frame = (int64_t)std::llround(t_end * fps);
+
+    std::vector<float> image;
+    if (!af::load_portrait(a.portrait, S, image, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    if (!a.frames_dir.empty() && mkdir(a.frames_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::fprintf(stderr, "error: cannot create %s: %s\n", a.frames_dir.c_str(), std::strerror(errno));
+        return 1;
+    }
+    af::VideoWriter video;
+    const std::string video_tmp = a.output.empty() ? "" : a.output + ".video.mp4";
+    if (!a.output.empty() && !video.open("ffmpeg", video_tmp, "", S, S, fps, err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+
+    af::GenOptions go;
+    go.nfe = a.nfe;
+    go.cfg_scale = a.cfg_scale;
+    go.seed = a.seed;
+    go.noise_file = a.noise_file;
+    go.normalized = a.normalized_set ? a.normalized : false;   // raw, as the live app
+    go.profile = a.profile;
+    af::LiveOptions lo;
+    lo.queue_blocks = a.queue_blocks;
+    af::LiveSession live(engine, go, lo);
+    auto t0 = Clock::now();
+    if (!live.open(image.data(), err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    const double ms_open = ms_since(t0);
+    std::fprintf(stderr, "live: %lld frames (%.2f s), nfe %d, %s audio, open (portrait + hidden primer) %.0f ms\n",
+                 (long long)end_frame, t_end, live.generator().nfe(), go.normalized ? "normalized" : "raw", ms_open);
+
+    // The audio track: each phrase at its start frame, cut at interrupts.
+    std::vector<float> mix((size_t)end_frame * spf, 0.f);
+    struct Placed { int64_t start, end; std::vector<float> pcm; };
+    std::vector<Placed> placed;
+
+    const size_t fb = live.frame_bytes();
+    std::vector<uint8_t> buf(fb * (size_t)nb);
+    int64_t written = 0;
+    auto write_frames = [&](const uint8_t* p, int n) -> bool {
+        for (int f = 0; f < n && !a.frames_dir.empty(); ++f) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "/frame_%05lld.png", (long long)(written + f));
+            if (!stbi_write_png((a.frames_dir + name).c_str(), S, S, 3, p + f * fb, S * 3)) {
+                err = "cannot write " + a.frames_dir + name;
+                return false;
+            }
+        }
+        if (video.is_open() && !video.write(p, n, err)) return false;
+        written += n;
+        return true;
+    };
+    auto drain = [&](bool wait_for_one) -> bool {
+        for (;;) {
+            const int n = live.pull(buf.data(), nb);
+            if (n < 0) { live.failed(&err); return false; }
+            if (n > 0) {
+                if (!write_frames(buf.data(), n)) return false;
+                wait_for_one = false;
+                continue;
+            }
+            if (!wait_for_one) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+
+    std::vector<double> idle_ms, speech_ms;
+    size_t next_ev = 0;
+    int late = 0, queue_full = 0;
+    const auto t_call = Clock::now();
+    int64_t next = 0;
+    while (next < end_frame) {
+        // Events whose frame is in the next block happen before its step: the
+        // simulated caller runs at least one block ahead of playback.
+        while (next_ev < events.size() && (int64_t)std::llround(events[next_ev].t * fps) < next + nb) {
+            const LiveEvent& e = events[next_ev++];
+            const int64_t f = (int64_t)std::llround(e.t * fps);
+            if (e.kind == "say") {
+                std::vector<float> pcm;
+                if (!af::load_audio(e.path, sr, pcm, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+                const auto tp = Clock::now();
+                const int64_t st = live.push_phrase(pcm.data(), pcm.size(), f, live.epoch(), err);
+                if (st < 0) { std::fprintf(stderr, "error: line %d: %s\n", e.line, err.c_str()); return 1; }
+                const int64_t n_fr = ((int64_t)pcm.size() + spf - 1) / spf;
+                std::fprintf(stderr, "  %6.2f s  say %s: %.2f s, frames %lld..%lld (asked %lld), wav2vec2 %.0f ms\n",
+                             e.t, e.path.c_str(), pcm.size() / (double)sr, (long long)st, (long long)(st + n_fr),
+                             (long long)f, ms_since(tp));
+                placed.push_back({st, st + n_fr, std::move(pcm)});
+            } else if (e.kind == "interrupt") {
+                const int64_t c = live.interrupt(f);
+                for (Placed& p : placed) p.end = std::min(p.end, std::max(p.start, c));
+                std::fprintf(stderr, "  %6.2f s  interrupt at frame %lld: idle from frame %lld\n", e.t, (long long)f,
+                             (long long)c);
+            }
+        }
+        // Realtime: block k is due at k * 400 ms; step one block ahead.
+        if (a.realtime) {
+            const auto due = t_call + std::chrono::microseconds((int64_t)((next - nb) * 1e6 / fps));
+            std::this_thread::sleep_until(due);
+        }
+        const auto ts = Clock::now();
+        const int64_t r = live.step(err);
+        if (r == af::LiveSession::kQueueFull) {
+            ++queue_full;
+            if (!drain(true)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+            continue;
+        }
+        if (r < 0) { std::fprintf(stderr, "error: step: %s\n", err.c_str()); return 1; }
+        const double ms = ms_since(ts);
+        bool speech = false;
+        for (const Placed& p : placed) speech = speech || (p.start < r + nb && p.end > r);
+        (speech ? speech_ms : idle_ms).push_back(ms);
+        if (a.realtime && ts + std::chrono::microseconds((int64_t)(ms * 1000)) >
+                              t_call + std::chrono::microseconds((int64_t)(r * 1e6 / fps)))
+            ++late;
+        next = r + nb;
+        if (!drain(false)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+        std::fprintf(stderr, "\rframes %lld / %lld", (long long)next, (long long)end_frame);
+    }
+    while (written < next)
+        if (!drain(true)) { std::fprintf(stderr, "\nerror: %s\n", err.c_str()); return 1; }
+    std::fprintf(stderr, "\n");
+
+    for (const Placed& p : placed)
+        for (int64_t i = 0; i < (p.end - p.start) * spf && i < (int64_t)p.pcm.size(); ++i) {
+            const int64_t k = p.start * spf + i;
+            if (k < (int64_t)mix.size()) mix[k] += p.pcm[i];
+        }
+    if (video.is_open()) {
+        if (!video.close(err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+        const std::string wav_tmp = a.output + ".audio.wav";
+        if (!af::write_wav_f32(wav_tmp, mix.data(), mix.size(), sr, err) ||
+            !af::mux_audio("ffmpeg", video_tmp, wav_tmp, a.output, err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        std::remove(video_tmp.c_str());
+        std::remove(wav_tmp.c_str());
+    }
+    auto stat = [](std::vector<double> v, const char* name) {
+        if (v.empty()) { std::printf("  %-7s   0 blocks\n", name); return; }
+        std::sort(v.begin(), v.end());
+        double sum = 0;
+        for (double x : v) sum += x;
+        std::printf("  %-7s %3zu blocks: median %.1f ms, mean %.1f ms, p90 %.1f ms, max %.1f ms\n", name, v.size(),
+                    v[v.size() / 2], sum / v.size(), v[(v.size() * 9) / 10], v.back());
+    };
+    std::printf("frames: %lld (%.2f s at %d fps)\n", (long long)written, written / (double)fps, fps);
+    if (!a.output.empty()) std::printf("output: %s\n", a.output.c_str());
+    if (!a.frames_dir.empty()) std::printf("frames dir: %s\n", a.frames_dir.c_str());
+    std::printf("open: %.1f ms (portrait encoder and hidden primer, primer %.1f ms)\n", ms_open,
+                live.generator().stats().ms_primer);
+    std::printf("step time per block (%s, %d threads, %s; budget %.0f ms):\n", engine.backend().device().c_str(),
+                engine.n_threads(), engine.overlap() ? "decoder overlapped" : "no overlap", 1000.0 * nb / fps);
+    stat(idle_ms, "idle");
+    stat(speech_ms, "speech");
+    std::printf("decoder: median %.1f ms per block\n", median(live.generator().stats().decode_ms));
+    if (a.realtime) std::printf("realtime: %d late block(s) of %zu\n", late, idle_ms.size() + speech_ms.size());
+    std::printf("queue full: %d\nstats: %s\n", queue_full, live.stats_json().c_str());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -389,5 +647,6 @@ int main(int argc, char** argv) {
     }
     Args a;
     if (argc < 2 || !parse_args(argc, argv, a)) { usage(argv[0]); return 2; }
+    if (!a.live_script.empty()) return run_live(a);
     return run_generate(a);
 }

@@ -28,6 +28,7 @@ The model has three parts:
 | M6 | `avatarforcing-cli`: portrait + speech WAV to mp4, end-to-end gate against the upstream streaming path | done |
 | M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; faster than real time on an NVIDIA Thor (one 400 ms block every 202 ms at nfe 6, 241 ms at nfe 10) | done |
 | M8 | C API: `libavatarforcing` with `include/avatarforcing.h`, offline generation to RGB frames or mp4, streaming sessions; the CLI and the API share one pipeline | done |
+| M9 | Live mode: a session that the caller steps once per block, with idle features between phrases, a hidden primer, interrupt and a bounded frame queue; `avatarforcing-cli --live` simulates a call | done |
 
 The C++ library holds all three parts in F32 on the ggml CPU or CUDA backend
 (`docs/gpu.md`): the
@@ -80,7 +81,9 @@ avatarforcing_free(ctx);
 ```
 
 It generates RGB frames or an mp4 file from a portrait and a WAV file or
-float PCM, and has sessions that take the audio phrase by phrase. The CLI
+float PCM, and has sessions that take the audio phrase by phrase. A live
+session drives the face for a whole call: the caller steps it once per
+400 ms block, and the face idles between phrases. The CLI
 and the API run the same pipeline (`src/pipeline.cpp`), so they give the
 same frames. `docs/capi.md` describes the functions, the options, the
 sessions and the thread rules.
@@ -129,7 +132,8 @@ ctest --test-dir build --output-on-failure
 
 `test_flow_parity` and `test_sampler_parity` read the flow baseline,
 `test_motion_parity` the motion baseline and `test_wav2vec2_parity` the
-wav2vec2 baseline. `test_capi` needs only the model GGUF (`docs/capi.md`).
+wav2vec2 baseline. `test_capi` and `test_capi_live` need only the model
+GGUF (`docs/capi.md`). `test_live_schedule` needs no model.
 
 ## Reference tooling
 
