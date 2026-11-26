@@ -62,6 +62,8 @@ struct Args {
     std::string live_script;
     bool realtime = false;     // pace the steps on the wall clock
     int queue_blocks = 3;
+    int reanchor_every = -1, reanchor_max_defer = -1, reanchor_fade = -1;   // < 0: the GGUF value
+    bool reanchor_hold = false;
 };
 
 void usage(const char* prog) {
@@ -104,7 +106,16 @@ void usage(const char* prog) {
         "live mode:\n"
         "  --realtime            step on the wall clock, one block every 400 ms, and count\n"
         "                        the late blocks (default: step as fast as possible)\n"
-        "  --queue-blocks N      blocks that may wait for the writer (default 3)\n",
+        "  --queue-blocks N      blocks that may wait for the writer (default 3)\n"
+        "  --reanchor-every N    steady blocks before a reanchor when idle; 0: none\n"
+        "                        (default: from the GGUF, 112)\n"
+        "  --reanchor-max-defer N\n"
+        "                        steady blocks before a reanchor also in speech; 0: none\n"
+        "                        (default: from the GGUF, 162)\n"
+        "  --reanchor-fade N     cross-fade frames after a reanchor; 0: none (default: from\n"
+        "                        the GGUF, 25)\n"
+        "  --reanchor-hold       the reanchor block repeats the last frame, as the live app\n"
+        "                        (default: compute it)\n",
         prog, prog, prog);
 }
 
@@ -138,6 +149,10 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--max-seconds") { if (!(v = val("--max-seconds"))) return false; a.max_seconds = std::atoi(v); }
         else if (k == "--live") { if (!(v = val("--live"))) return false; a.live_script = v; }
         else if (k == "--realtime") a.realtime = true;
+        else if (k == "--reanchor-every") { if (!(v = val("--reanchor-every"))) return false; a.reanchor_every = std::atoi(v); }
+        else if (k == "--reanchor-max-defer") { if (!(v = val("--reanchor-max-defer"))) return false; a.reanchor_max_defer = std::atoi(v); }
+        else if (k == "--reanchor-fade") { if (!(v = val("--reanchor-fade"))) return false; a.reanchor_fade = std::atoi(v); }
+        else if (k == "--reanchor-hold") a.reanchor_hold = true;
         else if (k == "--queue-blocks") { if (!(v = val("--queue-blocks"))) return false; a.queue_blocks = std::atoi(v); }
         else if (k == "--audio-mode") {
             if (!(v = val("--audio-mode"))) return false;
@@ -506,6 +521,10 @@ int run_live(const Args& a) {
     go.profile = a.profile;
     af::LiveOptions lo;
     lo.queue_blocks = a.queue_blocks;
+    lo.reanchor_every = a.reanchor_every;
+    lo.reanchor_max_defer = a.reanchor_max_defer;
+    lo.reanchor_fade_frames = a.reanchor_fade;
+    lo.reanchor_hold = a.reanchor_hold;
     af::LiveSession live(engine, go, lo);
     auto t0 = Clock::now();
     const auto t_open = t0;
@@ -551,7 +570,8 @@ int run_live(const Args& a) {
         }
     };
 
-    std::vector<double> idle_ms, speech_ms;
+    std::vector<double> idle_ms, speech_ms, reanchor_ms;
+    std::vector<int64_t> reanchor_frames;
     size_t next_ev = 0;
     int late = 0, queue_full = 0;
     const auto t_call = Clock::now();
@@ -596,7 +616,14 @@ int run_live(const Args& a) {
         const double ms = ms_since(ts);
         bool speech = false;
         for (const Placed& p : placed) speech = speech || (p.start < r + nb && p.end > r);
-        (speech ? speech_ms : idle_ms).push_back(ms);
+        if (live.last_reanchor_frame() == r) {
+            reanchor_ms.push_back(ms);
+            reanchor_frames.push_back(r);
+            std::fprintf(stderr, "\n  %6.2f s  reanchor at frame %lld (%s), %.0f ms\n", r / (double)fps, (long long)r,
+                         speech ? "speech" : "idle", ms);
+        } else {
+            (speech ? speech_ms : idle_ms).push_back(ms);
+        }
         if (a.realtime && ts + std::chrono::microseconds((int64_t)(ms * 1000)) >
                               t_call + std::chrono::microseconds((int64_t)(r * 1e6 / fps)))
             ++late;
@@ -625,11 +652,11 @@ int run_live(const Args& a) {
         std::remove(wav_tmp.c_str());
     }
     auto stat = [](std::vector<double> v, const char* name) {
-        if (v.empty()) { std::printf("  %-7s   0 blocks\n", name); return; }
+        if (v.empty()) { std::printf("  %-8s   0 blocks\n", name); return; }
         std::sort(v.begin(), v.end());
         double sum = 0;
         for (double x : v) sum += x;
-        std::printf("  %-7s %3zu blocks: median %.1f ms, mean %.1f ms, p90 %.1f ms, max %.1f ms\n", name, v.size(),
+        std::printf("  %-8s %3zu blocks: median %.1f ms, mean %.1f ms, p90 %.1f ms, max %.1f ms\n", name, v.size(),
                     v[v.size() / 2], sum / v.size(), v[(v.size() * 9) / 10], v.back());
     };
     std::printf("frames: %lld (%.2f s at %d fps)\n", (long long)written, written / (double)fps, fps);
@@ -643,8 +670,13 @@ int run_live(const Args& a) {
                 engine.n_threads(), engine.overlap() ? "decoder overlapped" : "no overlap", 1000.0 * nb / fps);
     stat(idle_ms, "idle");
     stat(speech_ms, "speech");
+    stat(reanchor_ms, "reanchor");
+    std::printf("reanchor frames:");
+    for (int64_t f : reanchor_frames) std::printf(" %lld", (long long)f);
+    std::printf("%s\n", reanchor_frames.empty() ? " none" : "");
     std::printf("decoder: median %.1f ms per block\n", median(live.generator().stats().decode_ms));
-    if (a.realtime) std::printf("realtime: %d late block(s) of %zu\n", late, idle_ms.size() + speech_ms.size());
+    if (a.realtime)
+        std::printf("realtime: %d late block(s) of %zu\n", late, idle_ms.size() + speech_ms.size() + reanchor_ms.size());
     std::printf("queue full: %d\nstats: %s\n", queue_full, live.stats_json().c_str());
     return 0;
 }
