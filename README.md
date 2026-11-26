@@ -26,7 +26,7 @@ The model has three parts:
 | M4 | Motion autoencoder: encoder, decoder with grid_sample warping, uint8 conversion, parity-gated | done |
 | M5 | wav2vec2 audio features (raw and normalized input), idle features, audio projection, parity-gated | done |
 | M6 | `avatarforcing-cli`: portrait + speech WAV to mp4, end-to-end gate against the upstream streaming path | done |
-| M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; at the edge of real time at nfe 6 on an NVIDIA Thor | done |
+| M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; faster than real time on an NVIDIA Thor (one 400 ms block every 208 ms at nfe 6, 253 ms at nfe 10) | done |
 
 The C++ library holds all three parts in F32 on the ggml CPU or CUDA backend
 (`docs/gpu.md`): the

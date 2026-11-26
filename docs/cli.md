@@ -28,7 +28,7 @@ avatarforcing-cli info avatarforcing-f32.gguf
 | `--threads N` | all cores | CPU threads |
 | `--backend B` | `cpu` | compute device: `cpu`, `cuda` or `cuda:N`; `--device` is an alias |
 | `--decode-batch N` | 1 on the CPU, 10 on a GPU | frames per decoder graph (0: a whole block) |
-| `--overlap`, `--no-overlap` | on for a GPU | decode block N in a second thread while the sampler computes block N + 1 |
+| `--overlap`, `--no-overlap` | on for a GPU | decode block N in a second thread while the sampler computes block N + 1; on CUDA the sampler then runs on high-priority streams |
 | `--profile` | off | per-op time profile of the decoder graphs (node by node, slow) |
 
 Give `-o`, `--frames-dir` or both. At the end the tool prints the time of
