@@ -170,9 +170,11 @@ session.
 
 The mp4 functions start `ffmpeg` before they do any other work. When ffmpeg
 cannot start, they fail at once with an error that names ffmpeg. They mux
-the input audio as AAC with `-shortest`, as the CLI does. The PCM variant
-writes the PCM to a temporary float WAV file next to the output file for
-ffmpeg, and removes it afterwards.
+the input audio as AAC with `-shortest`, as the CLI does. Audio shorter than
+the 2 s primer is padded with silence to 2 s, so the mp4 has the 50 primer
+frames. When ffmpeg fails, the error holds its exit status and its error
+output. The PCM variant writes the PCM to a temporary float WAV file next to
+the output file for ffmpeg, and removes it afterwards.
 
 ## Sessions
 
@@ -373,6 +375,13 @@ portrait and a 2.5 s WAV file to the current directory, then:
   frames are the same;
 - runs the same audio through a session and checks that the frames are the
   same as the offline frames.
+
+`tests/test_capi_mp4.c` tests mp4 output for speech shorter than the
+primer. It needs `AVATARFORCING_TEST_GGUF` and ffmpeg on `PATH`, and is
+skipped without them. It writes an mp4 from a 0.8 s WAV file and from 1.5 s
+of PCM. With ffprobe on `PATH`, it checks that each mp4 has 50 frames and
+that the audio is as long as the video. It also checks that an ffmpeg
+failure gives the exit status and the message of ffmpeg.
 
 `tests/test_capi_live.c` tests live mode. It needs `AVATARFORCING_TEST_GGUF`
 too. It runs one call of 150 frames twice:

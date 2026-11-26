@@ -239,18 +239,31 @@ class VideoWriter {
 public:
     ~VideoWriter();
     // ffmpeg: program name (looked up on PATH) or path. audio_path "": an
-    // mp4 with video only.
+    // mp4 with video only. The audio is muxed with -shortest; min_frames > 0
+    // pads audio that is shorter than min_frames / fps with silence, so
+    // that ffmpeg reads at least that many frames.
     bool open(const std::string& ffmpeg, const std::string& out_path, const std::string& audio_path, int w, int h,
-              int fps, std::string& err);
-    bool write(const uint8_t* frames, int n, std::string& err);   // [n, h, w, 3]
+              int fps, std::string& err, int min_frames = 0);
+    // [n, h, w, 3]. When ffmpeg stops reading and exits with status 0 (with
+    // -shortest it stops at the end of the audio), the frames are dropped
+    // and the call succeeds. When ffmpeg fails, err holds its exit status
+    // and its error output.
+    bool write(const uint8_t* frames, int n, std::string& err);
     // Closes the pipe and waits for ffmpeg; fails when ffmpeg failed.
     bool close(std::string& err);
-    bool is_open() const { return fd_ >= 0; }
+    bool is_open() const { return fd_ >= 0 || done_; }
 
 private:
+    // Waits for ffmpeg and its error output. Returns false and sets err
+    // when ffmpeg failed.
+    bool wait_ffmpeg(std::string& err);
+
     int w_ = 0, h_ = 0;
     int fd_ = -1;
     pid_t pid_ = -1;
+    bool done_ = false;          // ffmpeg exited with status 0 before the end of the frames
+    std::thread stderr_thread_;  // reads the error output of ffmpeg into stderr_
+    std::string stderr_;
 };
 
 // Copies the video of video_path and adds audio_path as AAC (-shortest).

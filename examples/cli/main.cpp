@@ -287,7 +287,9 @@ int run_generate(const Args& a) {
         return 1;
     }
     af::VideoWriter video;
-    if (!a.output.empty() && !video.open("ffmpeg", a.output, a.audio, S, S, fps, err)) {
+    // The video has at least the clip frames of the primer; pad shorter
+    // speech with silence so that ffmpeg reads them all.
+    if (!a.output.empty() && !video.open("ffmpeg", a.output, a.audio, S, S, fps, err, clip)) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }

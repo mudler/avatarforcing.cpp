@@ -29,6 +29,12 @@ if(TARGET avatarforcing_shared)
   add_test(NAME test_capi COMMAND test_capi)
   set_tests_properties(test_capi PROPERTIES SKIP_RETURN_CODE 77 LABELS "model" TIMEOUT 1800)
 
+  # mp4 output for speech shorter than the primer; needs ffmpeg too.
+  add_executable(test_capi_mp4 test_capi_mp4.c)
+  target_link_libraries(test_capi_mp4 PRIVATE avatarforcing_shared m)
+  add_test(NAME test_capi_mp4 COMMAND test_capi_mp4)
+  set_tests_properties(test_capi_mp4 PROPERTIES SKIP_RETURN_CODE 77 LABELS "model" TIMEOUT 1800)
+
   find_package(Threads REQUIRED)
   add_executable(test_capi_live test_capi_live.c)
   target_link_libraries(test_capi_live PRIVATE avatarforcing_shared Threads::Threads m)

@@ -162,8 +162,11 @@ AVATARFORCING_API void avatarforcing_free_frames(uint8_t* frames);
 
 /* Generates a video and writes it as an mp4 file (H.264 video, AAC audio)
  * with ffmpeg, as avatarforcing-cli -o does. The audio of the mp4 is the
- * input audio; the video stops at the end of the audio (-shortest). Fails
- * before any work when ffmpeg cannot be started. */
+ * input audio; the video stops at the end of the audio (-shortest). Audio
+ * shorter than the 2 s primer is padded with silence to 2 s, so the mp4
+ * has all the primer frames. Fails before any work when ffmpeg cannot be
+ * started. When ffmpeg fails, the error holds its exit status and its error
+ * output. */
 AVATARFORCING_API int avatarforcing_generate_mp4(avatarforcing_ctx* ctx, const char* portrait_path,
                                                  const char* wav_path, const char* output_path,
                                                  const char* request_json);

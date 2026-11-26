@@ -412,7 +412,8 @@ int run_offline(avatarforcing_ctx* ctx, const char* portrait_path, const AudioIn
             if (!af::write_wav_f32(tmp_wav.path, audio_in.pcm, (size_t)audio_in.n, audio_in.sr, err)) return failed(err);
             mux = tmp_wav.path;
         }
-        if (!video.open(ctx->ffmpeg, mp4_path, mux, S, S, e.fps(), err)) return failed(err);
+        // At least the primer frames; shorter speech is padded with silence.
+        if (!video.open(ctx->ffmpeg, mp4_path, mux, S, S, e.fps(), err, clip)) return failed(err);
     }
 
     uint8_t* buf = nullptr;

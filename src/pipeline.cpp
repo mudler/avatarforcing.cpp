@@ -537,7 +537,7 @@ namespace {
 // process by default. Block it on this thread for the write and discard a
 // SIGPIPE the write raised, so the caller gets EPIPE instead; the process
 // signal disposition stays as it is.
-bool write_all(int fd, const uint8_t* p, size_t n, std::string& err) {
+bool write_all(int fd, const uint8_t* p, size_t n, std::string& err, int& write_errno) {
     sigset_t pipe_set, old;
     sigemptyset(&pipe_set);
     sigaddset(&pipe_set, SIGPIPE);
@@ -552,9 +552,10 @@ bool write_all(int fd, const uint8_t* p, size_t n, std::string& err) {
         const ssize_t k = ::write(fd, p + off, n - off);
         if (k < 0) {
             if (errno == EINTR) continue;
+            write_errno = errno;
             err = std::string("writing to ffmpeg failed: ") + std::strerror(errno);
 #if defined(__linux__)
-            if (errno == EPIPE && !was_pending) {
+            if (write_errno == EPIPE && !was_pending) {
                 const struct timespec zero = {0, 0};
                 while (sigtimedwait(&pipe_set, nullptr, &zero) < 0 && errno == EINTR) {}
             }
@@ -578,9 +579,11 @@ VideoWriter::~VideoWriter() {
 }
 
 bool VideoWriter::open(const std::string& ffmpeg, const std::string& out_path, const std::string& audio_path, int w,
-                       int h, int fps, std::string& err) {
+                       int h, int fps, std::string& err, int min_frames) {
     w_ = w;
     h_ = h;
+    done_ = false;
+    stderr_.clear();
     // ffmpeg reads raw RGB frames on stdin and muxes the input audio, as
     // the upstream run_stream does (it encodes first, then muxes with
     // -shortest; one ffmpeg call gives the same result).
@@ -590,8 +593,16 @@ bool VideoWriter::open(const std::string& ffmpeg, const std::string& out_path, c
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", size, "-r", rate, "-i", "-",
         "-i", audio_path,
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-        out_path};
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"};
+    if (min_frames > 0) {
+        // Audio shorter than the video (speech shorter than the primer):
+        // -shortest would stop ffmpeg at the end of the audio, before it
+        // reads all frames. Pad the audio with silence to the video length.
+        // apad does not change audio that is already long enough.
+        const long long us = (long long)min_frames * 1000000LL / fps;
+        argv_s.insert(argv_s.end(), {"-af", "apad=whole_dur=" + std::to_string(us) + "us"});
+    }
+    argv_s.insert(argv_s.end(), {"-shortest", out_path});
     if (audio_path.empty())
         argv_s = {ffmpeg, "-y", "-loglevel", "error",
                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", size, "-r", rate, "-i", "-",
@@ -601,14 +612,26 @@ bool VideoWriter::open(const std::string& ffmpeg, const std::string& out_path, c
     argv.push_back(nullptr);
     // O_CLOEXEC: a second ffmpeg started from another thread must not
     // inherit this write end, or this ffmpeg never sees the end of input.
-    // dup2 onto stdin clears the flag for the child's read end.
-    int fds[2];
+    // dup2 onto stdin clears the flag for the child's read end. The same
+    // for the error output pipe.
+    int fds[2], efds[2];
 #if defined(__linux__)
     if (pipe2(fds, O_CLOEXEC) != 0) { err = std::string("pipe: ") + std::strerror(errno); return false; }
+    if (pipe2(efds, O_CLOEXEC) != 0) {
+        err = std::string("pipe: ") + std::strerror(errno);
+        ::close(fds[0]);
+        ::close(fds[1]);
+        return false;
+    }
 #else
     if (pipe(fds) != 0) { err = std::string("pipe: ") + std::strerror(errno); return false; }
-    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    if (pipe(efds) != 0) {
+        err = std::string("pipe: ") + std::strerror(errno);
+        ::close(fds[0]);
+        ::close(fds[1]);
+        return false;
+    }
+    for (int fd : {fds[0], fds[1], efds[0], efds[1]}) fcntl(fd, F_SETFD, FD_CLOEXEC);
 #endif
 #if defined(F_SETNOSIGPIPE)
     fcntl(fds[1], F_SETNOSIGPIPE, 1);
@@ -616,11 +639,14 @@ bool VideoWriter::open(const std::string& ffmpeg, const std::string& out_path, c
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, fds[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, efds[1], STDERR_FILENO);
     const int rc = posix_spawnp(&pid_, ffmpeg.c_str(), &fa, nullptr, argv.data(), environ);
     posix_spawn_file_actions_destroy(&fa);
     ::close(fds[0]);
+    ::close(efds[1]);
     if (rc != 0) {
         ::close(fds[1]);
+        ::close(efds[0]);
         pid_ = -1;
         if (rc == ENOENT)
             err = "cannot start " + ffmpeg + ": not found (mp4 output needs ffmpeg on PATH)";
@@ -629,25 +655,74 @@ bool VideoWriter::open(const std::string& ffmpeg, const std::string& out_path, c
         return false;
     }
     fd_ = fds[1];
+    // Keep the error output of ffmpeg for the error message. Read it all,
+    // so that ffmpeg never blocks on a full pipe; keep the last 4 KiB.
+    const int efd = efds[0];
+    stderr_thread_ = std::thread([this, efd] {
+        char buf[1024];
+        for (;;) {
+            const ssize_t k = ::read(efd, buf, sizeof(buf));
+            if (k < 0 && errno == EINTR) continue;
+            if (k <= 0) break;
+            stderr_.append(buf, (size_t)k);
+            if (stderr_.size() > 8192) stderr_.erase(0, stderr_.size() - 4096);
+        }
+        ::close(efd);
+    });
     return true;
 }
 
 bool VideoWriter::write(const uint8_t* frames, int n, std::string& err) {
+    if (done_) return true;
     if (fd_ < 0) { err = "the video writer is not open"; return false; }
-    return write_all(fd_, frames, (size_t)n * w_ * h_ * 3, err);
+    int write_errno = 0;
+    if (write_all(fd_, frames, (size_t)n * w_ * h_ * 3, err, write_errno)) return true;
+    // ffmpeg stopped reading. Report its own error when it failed.
+    const std::string write_err = err;
+    ::close(fd_);
+    fd_ = -1;
+    if (!wait_ffmpeg(err)) {
+        err = "ffmpeg stopped reading frames: " + err;
+        return false;
+    }
+    if (write_errno != EPIPE) {
+        err = write_err;
+        return false;
+    }
+    done_ = true;   // ffmpeg finished the file; drop the frames that are left
+    return true;
+}
+
+bool VideoWriter::wait_ffmpeg(std::string& err) {
+    if (pid_ <= 0) return true;
+    int st = 0;
+    while (waitpid(pid_, &st, 0) < 0 && errno == EINTR) {}
+    pid_ = -1;
+    if (stderr_thread_.joinable()) stderr_thread_.join();
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0) return true;
+    if (WIFEXITED(st))
+        err = "ffmpeg failed (exit status " + std::to_string(WEXITSTATUS(st)) + ")";
+    else if (WIFSIGNALED(st))
+        err = "ffmpeg failed (killed by signal " + std::to_string(WTERMSIG(st)) + ")";
+    else
+        err = "ffmpeg failed (status " + std::to_string(st) + ")";
+    // The error output of ffmpeg, on one line.
+    std::string msg;
+    bool line_end = false;
+    for (char c : stderr_) {
+        if (c == '\r' || c == '\n') { line_end = true; continue; }
+        if (line_end && !msg.empty()) msg += "; ";
+        line_end = false;
+        msg += c;
+    }
+    if (!msg.empty()) err += ": " + msg;
+    return false;
 }
 
 bool VideoWriter::close(std::string& err) {
-    bool ok = true;
+    done_ = false;
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
-    if (pid_ > 0) {
-        int st = 0;
-        while (waitpid(pid_, &st, 0) < 0 && errno == EINTR) {}
-        ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
-        if (!ok) err = "ffmpeg failed (status " + std::to_string(st) + ")";
-        pid_ = -1;
-    }
-    return ok;
+    return wait_ffmpeg(err);
 }
 
 bool mux_audio(const std::string& ffmpeg, const std::string& video_path, const std::string& audio_path,

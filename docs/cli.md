@@ -99,10 +99,12 @@ AvatarVoice:
    [0, 255] (eps 1e-8), truncate.
 7. **Output.** Raw RGB frames go to `ffmpeg` on a pipe, at 25 fps, encoded
    with libx264 (yuv420p). The input audio file is muxed as AAC with
-   `-shortest`.
+   `-shortest`. Audio shorter than the 2 s primer is padded with silence
+   to 2 s (`apad=whole_dur`).
 
-The video has `max(50, T)` frames. When the audio is shorter than 2 s,
-`-shortest` cuts the video to the audio length, as upstream does.
+The video has `max(50, T)` frames. When the audio is shorter than 2 s, the
+mp4 has the 50 primer frames and 2 s of audio: the speech, then silence.
+Upstream cuts the video to the audio length with `-shortest`.
 
 ### Differences from upstream `run_stream`
 
@@ -236,4 +238,5 @@ the time.
 
 `-shortest` makes ffmpeg stop at the end of the audio stream. With 198 frames
 (7.92 s) and 7.90 s of audio, the mp4 has 197 frames. Upstream muxes with
-`-shortest` too.
+`-shortest` too. Audio shorter than the 2 s primer is padded with silence to
+2 s, so the mp4 always has the 50 primer frames.
