@@ -11,6 +11,7 @@
 #include "wav2vec2.hpp"
 #include "common.hpp"
 #include "flow.hpp"
+#include "quant_policy.hpp"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -173,7 +174,8 @@ bool AudioEncoder::load(const std::string& gguf_path) {
         ggml_tensor* t = loader_.require(name);
         if (!t) { ok = false; return; }
         for (size_t i = 0; i < ne.size(); ++i)
-            if (t->ne[i] != ne[i] || t->type != GGML_TYPE_F32) {
+            // ModelLoader has checked the type against the quantization policy.
+            if (t->ne[i] != ne[i] || (t->type != GGML_TYPE_F32 && !quant_allowed(name))) {
                 AF_LOG("tensor %s: unexpected shape or type", name.c_str());
                 ok = false;
                 return;

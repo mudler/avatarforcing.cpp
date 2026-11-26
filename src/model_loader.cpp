@@ -1,5 +1,6 @@
 #include "model_loader.hpp"
 #include "common.hpp"
+#include "quant_policy.hpp"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -149,6 +150,20 @@ bool ModelLoader::load(const std::string& path, ggml_backend_t backend,
     for (int64_t i = 0; ok && i < nt; ++i)
         if (has_prefix(gguf_get_tensor_name(g, i), prefixes)) ids.push_back(i);
     if (ok && ids.empty()) { AF_LOG("no tensors match the requested prefixes"); ok = false; }
+
+    // Types other than F32 only where the quantization policy allows them
+    // (src/quant_policy.hpp): F16 or a block type, on a 2-D weight matrix.
+    for (size_t k = 0; ok && k < ids.size(); ++k) {
+        const char* name = gguf_get_tensor_name(g, ids[k]);
+        const ggml_tensor* t = ggml_get_tensor(meta, name);
+        if (t->type == GGML_TYPE_F32) continue;
+        const bool type_ok = t->type == GGML_TYPE_F16 || ggml_is_quantized(t->type);
+        if (!type_ok || !quant_allowed(name) || ggml_n_dims(t) != 2) {
+            AF_LOG("tensor %s: type %s is not allowed for this tensor (docs/quantization.md)", name,
+                   ggml_type_name(t->type));
+            ok = false;
+        }
+    }
 
     if (ok) {
         ggml_init_params p = { ggml_tensor_overhead() * (ids.size() + 1), nullptr, true };

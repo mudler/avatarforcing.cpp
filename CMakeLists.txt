@@ -86,6 +86,7 @@ add_library(avatarforcing STATIC
     src/common.cpp
     src/backend.cpp
     src/model_loader.cpp
+    src/quant_policy.cpp
     src/flow.cpp
     src/sampler.cpp
     src/grid_sample.cpp
