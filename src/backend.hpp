@@ -41,6 +41,11 @@ public:
     int n_threads() const { return n_threads_; }
     void set_n_threads(int n);
 
+    // Runs this backend's work on high-priority streams (the patched CUDA
+    // backend): when two backends share the GPU, its kernels are scheduled
+    // first. Returns false when the backend cannot do this.
+    bool set_high_priority(bool on);
+
     // Device name from an environment variable (e.g. AVATARFORCING_TEST_BACKEND),
     // "cpu" when it is unset.
     static std::string device_from_env(const char* var);

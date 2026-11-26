@@ -106,6 +106,17 @@ bool Backend::check_ops(ggml_cgraph* gf) const {
     return false;
 }
 
+bool Backend::set_high_priority(bool on) {
+    if (!backend_ || is_cpu_) return false;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_));
+    if (!reg) return false;
+    using Fn = void (*)(ggml_backend_t, bool);
+    auto fn = (Fn)ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_high_priority");
+    if (!fn) return false;
+    fn(backend_, on);
+    return true;
+}
+
 // Profile through the op profiler of the patched CUDA backend: the whole
 // graph runs as usual (with kernel fusion, without CUDA graphs) and every
 // kernel launch, a single node or a fused group, is timed with CUDA events.

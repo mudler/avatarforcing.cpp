@@ -462,6 +462,11 @@ int run_generate(const Args& a) {
     if (overlap) {
         be_dec_own.reset(new af::Backend(n_threads, a.backend));
         if (!be_dec_own->ok()) return 1;
+        // The sampler is the latency-bound stage: its many small kernels get
+        // the free SMs first while the decoder fills the rest of the GPU.
+        // AVATARFORCING_SAMPLER_PRIORITY=0 turns this off.
+        const char* sp = std::getenv("AVATARFORCING_SAMPLER_PRIORITY");
+        if (!(sp && std::strcmp(sp, "0") == 0)) be.set_high_priority(true);
     }
     af::Backend& bed = overlap ? *be_dec_own : be;
     af::MotionModel motion(bed);
