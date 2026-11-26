@@ -2,7 +2,7 @@
 #include <string>
 #include <vector>
 
-namespace af_cli {
+namespace af {
 
 // Decoded WAV file: mono float PCM in [-1, 1) at the file's own rate.
 struct Wav {
@@ -22,4 +22,7 @@ bool read_wav_mono(const std::string& path, Wav& out, std::string& err);
 // when the rates are equal.
 std::vector<float> resample(const std::vector<float>& in, int sr_in, int sr_out);
 
-} // namespace af_cli
+// Writes mono float PCM as a 32-bit float WAV file.
+bool write_wav_f32(const std::string& path, const float* pcm, size_t n, int sample_rate, std::string& err);
+
+} // namespace af

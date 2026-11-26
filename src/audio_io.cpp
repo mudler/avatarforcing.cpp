@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace af_cli {
+namespace af {
 
 bool read_wav_mono(const std::string& path, Wav& out, std::string& err) {
     drwav wav;
@@ -36,6 +36,24 @@ bool read_wav_mono(const std::string& path, Wav& out, std::string& err) {
         }
     }
     return true;
+}
+
+bool write_wav_f32(const std::string& path, const float* pcm, size_t n, int sample_rate, std::string& err) {
+    drwav_data_format fmt;
+    fmt.container = drwav_container_riff;
+    fmt.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+    fmt.channels = 1;
+    fmt.sampleRate = (drwav_uint32)sample_rate;
+    fmt.bitsPerSample = 32;
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path.c_str(), &fmt, nullptr)) {
+        err = "cannot create WAV file: " + path;
+        return false;
+    }
+    const drwav_uint64 put = drwav_write_pcm_frames(&wav, n, pcm);
+    const bool ok = drwav_uninit(&wav) == DRWAV_SUCCESS && put == n;
+    if (!ok) err = "cannot write WAV file: " + path;
+    return ok;
 }
 
 namespace {
@@ -91,4 +109,4 @@ std::vector<float> resample(const std::vector<float>& in, int sr_in, int sr_out)
     return out;
 }
 
-} // namespace af_cli
+} // namespace af

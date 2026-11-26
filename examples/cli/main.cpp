@@ -2,54 +2,33 @@
 //
 // The pipeline follows the offline streaming path of the upstream code
 // (inference.py run_stream and AvatarForcing.inference_stream); see
-// docs/cli.md for the details and the differences from the live app.
+// docs/cli.md for the details and the differences from the live app. The
+// pipeline itself is in src/pipeline.cpp, shared with the C API.
 
 #include "audio_io.hpp"
-
 #include "backend.hpp"
-#include "common.hpp"
 #include "flow.hpp"
-#include "motion.hpp"
-#include "sampler.hpp"
-#include "wav2vec2.hpp"
+#include "pipeline.hpp"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_ONLY_PNG
-#define STBI_ONLY_JPEG
-#define STBI_ONLY_BMP
-#include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cmath>
-#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <condition_variable>
-#include <deque>
-#include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
-#include <spawn.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-extern char** environ;
 
 namespace {
 
@@ -236,194 +215,6 @@ int run_info(const std::string& path) {
     return 0;
 }
 
-uint32_t gguf_u32(const std::string& path, const char* key, uint32_t fallback) {
-    gguf_init_params p = {/*no_alloc=*/true, /*ctx=*/nullptr};
-    gguf_context* g = gguf_init_from_file(path.c_str(), p);
-    if (!g) return fallback;
-    const int64_t id = gguf_find_key(g, key);
-    uint32_t v = fallback;
-    if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_UINT32) v = gguf_get_val_u32(g, id);
-    gguf_free(g);
-    return v;
-}
-
-// ---------------------------------------------------------------------------
-// noise
-
-// Seeded standard-normal noise: xoshiro256** seeded through splitmix64, Box-
-// Muller in double precision. It does not reproduce torch.randn.
-class NoiseSource {
-public:
-    bool open_file(const std::string& path, size_t n_needed) {
-        FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) { std::fprintf(stderr, "error: cannot open noise file %s\n", path.c_str()); return false; }
-        std::fseek(f, 0, SEEK_END);
-        const long sz = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        if (sz < 0 || (size_t)sz < n_needed * sizeof(float)) {
-            std::fprintf(stderr, "error: noise file %s has %ld bytes, the run needs %zu float32 values (%zu bytes)\n",
-                         path.c_str(), sz, n_needed, n_needed * sizeof(float));
-            std::fclose(f);
-            return false;
-        }
-        file_.resize(n_needed);
-        const size_t got = std::fread(file_.data(), sizeof(float), n_needed, f);
-        std::fclose(f);
-        if (got != n_needed) { std::fprintf(stderr, "error: short read on %s\n", path.c_str()); return false; }
-        from_file_ = true;
-        return true;
-    }
-    void seed(uint64_t s) {
-        for (auto& w : st_) w = splitmix64(s);
-    }
-    void next(size_t n, std::vector<float>& out) {
-        out.resize(n);
-        if (from_file_) {
-            std::memcpy(out.data(), file_.data() + pos_, n * sizeof(float));
-            pos_ += n;
-            return;
-        }
-        for (size_t i = 0; i < n; ++i) out[i] = (float)gauss();
-    }
-
-private:
-    static uint64_t splitmix64(uint64_t& x) {
-        uint64_t z = (x += 0x9e3779b97f4a7c15ULL);
-        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-        return z ^ (z >> 31);
-    }
-    static uint64_t rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
-    uint64_t next_u64() {
-        const uint64_t r = rotl(st_[1] * 5, 7) * 9, t = st_[1] << 17;
-        st_[2] ^= st_[0]; st_[3] ^= st_[1]; st_[1] ^= st_[2]; st_[0] ^= st_[3];
-        st_[2] ^= t; st_[3] = rotl(st_[3], 45);
-        return r;
-    }
-    double uniform() { return ((next_u64() >> 11) + 0.5) * (1.0 / 9007199254740992.0); }   // (0, 1)
-    double gauss() {
-        if (have_spare_) { have_spare_ = false; return spare_; }
-        const double u1 = uniform(), u2 = uniform();
-        const double r = std::sqrt(-2.0 * std::log(u1)), th = 6.283185307179586 * u2;
-        spare_ = r * std::sin(th);
-        have_spare_ = true;
-        return r * std::cos(th);
-    }
-
-    uint64_t st_[4] = {0, 0, 0, 0};
-    bool have_spare_ = false;
-    double spare_ = 0.0;
-    bool from_file_ = false;
-    std::vector<float> file_;
-    size_t pos_ = 0;
-};
-
-// ---------------------------------------------------------------------------
-// frame output
-
-class FrameSink {
-public:
-    ~FrameSink() { close(); }
-
-    bool open(const Args& a, int w, int h, int fps) {
-        w_ = w;
-        h_ = h;
-        if (!a.frames_dir.empty()) {
-            if (mkdir(a.frames_dir.c_str(), 0755) != 0 && errno != EEXIST) {
-                std::fprintf(stderr, "error: cannot create %s: %s\n", a.frames_dir.c_str(), std::strerror(errno));
-                return false;
-            }
-            dir_ = a.frames_dir;
-        }
-        if (a.output.empty()) return true;
-        // ffmpeg reads raw RGB frames on stdin and muxes the input audio, as
-        // the upstream run_stream does (it encodes first, then muxes with
-        // -shortest; one ffmpeg call gives the same result).
-        const std::string size = std::to_string(w) + "x" + std::to_string(h), rate = std::to_string(fps);
-        std::vector<std::string> argv_s = {
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", size, "-r", rate, "-i", "-",
-            "-i", a.audio,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-            a.output};
-        std::vector<char*> argv;
-        for (auto& s : argv_s) argv.push_back(const_cast<char*>(s.c_str()));
-        argv.push_back(nullptr);
-        int fds[2];
-        if (pipe(fds) != 0) { std::perror("pipe"); return false; }
-        posix_spawn_file_actions_t fa;
-        posix_spawn_file_actions_init(&fa);
-        posix_spawn_file_actions_adddup2(&fa, fds[0], STDIN_FILENO);
-        posix_spawn_file_actions_addclose(&fa, fds[0]);
-        posix_spawn_file_actions_addclose(&fa, fds[1]);
-        const int rc = posix_spawnp(&pid_, "ffmpeg", &fa, nullptr, argv.data(), environ);
-        posix_spawn_file_actions_destroy(&fa);
-        ::close(fds[0]);
-        if (rc != 0) {
-            ::close(fds[1]);
-            std::fprintf(stderr, "error: cannot start ffmpeg: %s\n", std::strerror(rc));
-            pid_ = -1;
-            return false;
-        }
-        std::signal(SIGPIPE, SIG_IGN);
-        fd_ = fds[1];
-        return true;
-    }
-
-    // frames: [n, h, w, 3] uint8
-    bool write(const uint8_t* frames, int n) {
-        const size_t fb = (size_t)w_ * h_ * 3;
-        for (int f = 0; f < n; ++f) {
-            const uint8_t* p = frames + f * fb;
-            if (!dir_.empty()) {
-                char name[64];
-                std::snprintf(name, sizeof(name), "/frame_%05d.png", count_);
-                if (!stbi_write_png((dir_ + name).c_str(), w_, h_, 3, p, w_ * 3)) {
-                    std::fprintf(stderr, "error: cannot write %s%s\n", dir_.c_str(), name);
-                    return false;
-                }
-            }
-            if (fd_ >= 0) {
-                size_t off = 0;
-                while (off < fb) {
-                    const ssize_t k = ::write(fd_, p + off, fb - off);
-                    if (k < 0) {
-                        if (errno == EINTR) continue;
-                        std::fprintf(stderr, "error: writing to ffmpeg failed: %s\n", std::strerror(errno));
-                        return false;
-                    }
-                    off += (size_t)k;
-                }
-            }
-            ++count_;
-        }
-        return true;
-    }
-
-    // Closes the pipe and waits for ffmpeg. Returns false when ffmpeg failed.
-    bool close() {
-        bool ok = true;
-        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
-        if (pid_ > 0) {
-            int st = 0;
-            while (waitpid(pid_, &st, 0) < 0 && errno == EINTR) {}
-            ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
-            if (!ok) std::fprintf(stderr, "error: ffmpeg failed (status %d)\n", st);
-            pid_ = -1;
-        }
-        return ok;
-    }
-
-    int count() const { return count_; }
-
-private:
-    int w_ = 0, h_ = 0, count_ = 0;
-    std::string dir_;
-    int fd_ = -1;
-    pid_t pid_ = -1;
-};
-
 double median(std::vector<double> v) {
     if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
@@ -442,288 +233,117 @@ int run_generate(const Args& a) {
         std::fprintf(stderr, "error: give -o OUT.mp4 and/or --frames-dir DIR\n");
         return 2;
     }
-    const int n_threads = a.threads > 0 ? a.threads : std::max(1, (int)sysconf(_SC_NPROCESSORS_ONLN));
     const auto t_all = Clock::now();
+    std::string err;
 
     // ---- load ----
-    auto t0 = Clock::now();
-    size_t mem_free0 = 0, mem_total = 0;
-    af::Backend be(n_threads, a.backend);
-    if (!be.ok()) { std::fprintf(stderr, "error: backend %s is not available\n", a.backend.c_str()); return 1; }
-    ggml_backend_dev_memory(ggml_backend_get_device(be.handle()), &mem_free0, &mem_total);
-    af::FlowModel flow(be);
-    if (!flow.load(a.model)) { std::fprintf(stderr, "error: flow transformer load failed\n"); return 1; }
-    af::AudioEncoder audio(be, flow);
-    if (!audio.load(a.model)) { std::fprintf(stderr, "error: wav2vec2 load failed\n"); return 1; }
-    // With overlap, the decoder gets its own backend instance (on a GPU: its
-    // own stream, graph allocator and buffers) and runs in a second thread.
-    const bool overlap = a.overlap < 0 ? !be.is_cpu() : a.overlap > 0;
-    std::unique_ptr<af::Backend> be_dec_own;
-    if (overlap) {
-        be_dec_own.reset(new af::Backend(n_threads, a.backend));
-        if (!be_dec_own->ok()) return 1;
-        // The sampler is the latency-bound stage: its many small kernels get
-        // the free SMs first while the decoder fills the rest of the GPU.
-        // AVATARFORCING_SAMPLER_PRIORITY=0 turns this off.
-        const char* sp = std::getenv("AVATARFORCING_SAMPLER_PRIORITY");
-        if (!(sp && std::strcmp(sp, "0") == 0)) be.set_high_priority(true);
-    }
-    af::Backend& bed = overlap ? *be_dec_own : be;
-    af::MotionModel motion(bed);
-    if (!motion.load(a.model)) { std::fprintf(stderr, "error: motion autoencoder load failed\n"); return 1; }
-    const int decode_batch = a.decode_batch >= 0 ? a.decode_batch : (bed.is_cpu() ? 1 : 0);
-    motion.set_chunk_frames(decode_batch);
-    const double ms_load = ms_since(t0);
-    const af::FlowConfig& fc = flow.config();
-    const int fps = (int)gguf_u32(a.model, "avatarforcing.fps", 25);
-    const int S = (int)motion.config().size;
-    const int D = (int)fc.dim_w, clip = (int)fc.clip_frames, nb = (int)fc.block_frames;
-    const int ctx = (int)fc.context_frames;
-    const int sr = (int)audio.config().sample_rate;
+    af::EngineOptions eo;
+    eo.backend = a.backend;
+    eo.threads = a.threads;
+    eo.decode_batch = a.decode_batch;
+    eo.overlap = a.overlap;
+    af::Engine engine;
+    if (!engine.load(a.model, eo, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    af::Backend& be = engine.backend();
+    const int n_threads = engine.n_threads();
+    const bool overlap = engine.overlap();
+    const int fps = engine.fps(), S = engine.size(), sr = engine.sample_rate();
+    const af::FlowConfig& fc = engine.flow().config();
+    const int clip = (int)fc.clip_frames, nb = (int)fc.block_frames;
 
     // ---- inputs ----
-    int iw = 0, ih = 0, ic = 0;
-    uint8_t* img = stbi_load(a.portrait.c_str(), &iw, &ih, &ic, 3);
-    if (!img) { std::fprintf(stderr, "error: cannot read %s: %s\n", a.portrait.c_str(), stbi_failure_reason()); return 1; }
-    if (iw != S || ih != S) {
-        std::fprintf(stderr, "error: the portrait must be a pre-cropped %dx%d face image, got %dx%d\n", S, S, iw, ih);
-        stbi_image_free(img);
-        return 1;
-    }
-    // [3, S, S] in [-1, 1], (u8 / 255 - 0.5) / 0.5 in float32.
-    std::vector<float> image((size_t)3 * S * S);
-    for (int y = 0; y < S; ++y)
-        for (int x = 0; x < S; ++x)
-            for (int c = 0; c < 3; ++c)
-                image[((size_t)c * S + y) * S + x] = ((float)img[((size_t)y * S + x) * 3 + c] / 255.0f - 0.5f) / 0.5f;
-    stbi_image_free(img);
-
-    af_cli::Wav wav;
-    std::string err;
-    if (!af_cli::read_wav_mono(a.audio, wav, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
-    std::vector<float> pcm = af_cli::resample(wav.pcm, wav.sample_rate, sr);
+    std::vector<float> image;
+    if (!af::load_portrait(a.portrait, S, image, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    af::Wav wav;
+    if (!af::read_wav_mono(a.audio, wav, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    std::vector<float> pcm = af::resample(wav.pcm, wav.sample_rate, sr);
     if (pcm.empty()) { std::fprintf(stderr, "error: %s has no samples\n", a.audio.c_str()); return 1; }
     std::fprintf(stderr, "audio: %s, %d Hz, %d ch, %.2f s%s\n", a.audio.c_str(), wav.sample_rate, wav.channels,
                  wav.pcm.size() / (double)wav.sample_rate,
                  wav.sample_rate != sr ? " (resampled to 16 kHz)" : "");
 
-    FrameSink sink;
-    if (!sink.open(a, S, S, fps)) return 1;
+    if (!a.frames_dir.empty() && mkdir(a.frames_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::fprintf(stderr, "error: cannot create %s: %s\n", a.frames_dir.c_str(), std::strerror(errno));
+        return 1;
+    }
+    af::VideoWriter video;
+    if (!a.output.empty() && !video.open("ffmpeg", a.output, a.audio, S, S, fps, err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    int written = 0, n_frames_out = 0;
+    auto sink = [&](const uint8_t* frames, int n, std::string& e) -> bool {
+        const size_t fb = (size_t)S * S * 3;
+        for (int f = 0; f < n; ++f) {
+            if (a.frames_dir.empty()) break;
+            char name[64];
+            std::snprintf(name, sizeof(name), "/frame_%05d.png", written + f);
+            if (!stbi_write_png((a.frames_dir + name).c_str(), S, S, 3, frames + f * fb, S * 3)) {
+                e = "cannot write " + a.frames_dir + name;
+                return false;
+            }
+        }
+        if (video.is_open() && !video.write(frames, n, e)) return false;
+        written += n;
+        if (!overlap) std::fprintf(stderr, "\rframes %d / %d", written, n_frames_out);
+        return true;
+    };
+
+    af::GenOptions go;
+    go.nfe = a.nfe;
+    go.cfg_scale = a.cfg_scale;
+    go.seed = a.seed;
+    go.noise_file = a.noise_file;
+    go.normalized = a.normalized;
+    go.max_seconds = a.max_seconds;
+    go.profile = a.profile;
+    af::Generator gen(engine, go, sink);
 
     const auto t_gen = Clock::now();
 
     // ---- portrait encoder ----
-    t0 = Clock::now();
-    af::Portrait portrait;
-    if (!motion.encode(image.data(), portrait)) { std::fprintf(stderr, "error: motion encoder failed\n"); return 1; }
-    if (!motion.set_portrait(portrait)) return 1;
-    const double ms_encode = ms_since(t0);
+    if (!gen.encode_portrait(image.data(), err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
 
     // ---- audio features ----
-    t0 = Clock::now();
-    const size_t cap = a.max_seconds > 0 ? (size_t)a.max_seconds * sr : pcm.size();
+    auto t0 = Clock::now();
     std::vector<float> feats;
     int T = 0;
-    if (a.normalized) {
-        // Upstream normalizes the whole file, then keeps the first 30 s.
-        // A whole number of seconds is a whole number of frames (640
-        // samples), so the kept part needs no padding.
-        std::vector<float> x;
-        int n_full = 0;
-        audio.model_input(pcm.data(), pcm.size(), af::AudioInputMode::Normalized, x, n_full);
-        if (pcm.size() > cap) {
-            x.resize(cap);
-            n_full = (int)(cap / audio.config().samples_per_frame);
-        }
-        std::vector<float> stacked;
-        if (!audio.hidden_states(x, n_full, stacked)) { std::fprintf(stderr, "error: wav2vec2 failed\n"); return 1; }
-        if (!flow.audio_projection(n_full, stacked.data(), feats)) return 1;
-        T = n_full;
-    } else {
-        if (!audio.features(pcm.data(), std::min(cap, pcm.size()), af::AudioInputMode::Raw, feats, T)) {
-            std::fprintf(stderr, "error: wav2vec2 failed\n");
-            return 1;
-        }
+    bool capped = false;
+    if (!af::clip_features(engine, pcm, a.normalized, a.max_seconds, feats, T, capped, err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
     }
-    if (pcm.size() > cap)
+    if (capped)
         std::fprintf(stderr, "audio: longer than %d s, only the first %d s drive the video\n", a.max_seconds, a.max_seconds);
     const double ms_audio = ms_since(t0);
-    const int E = (int)fc.audio_proj_out;   // feature width, the flow transformer dim_a
 
     // ---- sampler setup ----
-    af::Sampler sampler(flow);
-    if (!sampler.init(a.nfe, a.cfg_scale)) return 1;
-    sampler.set_identity(portrait.r_s.data());
+    if (!gen.init_sampler(err) || !gen.check_noise(T, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     const int n_steady = T > clip ? (T - clip + nb - 1) / nb : 0;
-    NoiseSource noise;
-    if (!a.noise_file.empty()) {
-        if (!noise.open_file(a.noise_file, (size_t)clip * D + (size_t)n_steady * nb * D)) return 1;
-    } else {
-        noise.seed(a.seed);
-    }
-    const int n_frames_out = clip + std::max(0, T - clip);
+    n_frames_out = af::Generator::frames_for(T, clip);
     std::fprintf(stderr, "run: %d audio frames (%.2f s), primer %d + %d steady blocks -> %d frames, nfe %d, cfg %.2f, "
                  "%s audio, %d threads, noise %s\n",
-                 T, T / (double)fps, clip, n_steady, n_frames_out, sampler.nfe(), sampler.cfg_scale(),
+                 T, T / (double)fps, clip, n_steady, n_frames_out, gen.nfe(), gen.cfg_scale(),
                  a.normalized ? "normalized" : "raw", n_threads,
                  a.noise_file.empty() ? ("seed " + std::to_string(a.seed)).c_str() : a.noise_file.c_str());
 
-    // Audio feature rows [lo, lo + n), padded by repeating the last row of the
-    // track (F.pad replicate on the slice).
-    auto window = [&](int lo, int n, std::vector<float>& w) {
-        w.resize((size_t)n * E);
-        for (int r = 0; r < n; ++r) {
-            const int src = std::min(lo + r, T - 1);
-            std::memcpy(w.data() + (size_t)r * E, feats.data() + (size_t)src * E, E * sizeof(float));
-        }
-    };
-
-    double ms_sampler = 0, ms_decode = 0, ms_out = 0, ms_primer = 0;
-    std::vector<double> steady_ms, decode_ms, period_ms;
-    std::vector<float> wa, nz, x, pixels;
-    std::vector<uint8_t> u8;
-    int decoded = 0, blocks_done = 0;
-    const int n_primer_blocks = (clip + nb - 1) / nb;
-    const auto t_start = Clock::now();
-    auto t_last_done = t_start;
-    double ms_first_block = 0;
-
-    // Convert and write one decoded block. period_ms: time between two
-    // finished steady blocks, the pipeline throughput.
-    auto output = [&](const std::vector<float>& px, int n) -> bool {
-        auto td = Clock::now();
-        af::MotionModel::to_u8(px.data(), n, S, S, u8);
-        const bool ok = sink.write(u8.data(), n);
-        ms_out += ms_since(td);
-        decoded += n;
-        const auto now = Clock::now();
-        if (blocks_done == 0) ms_first_block = std::chrono::duration<double, std::milli>(now - t_start).count();
-        if (blocks_done >= n_primer_blocks) period_ms.push_back(std::chrono::duration<double, std::milli>(now - t_last_done).count());
-        t_last_done = now;
-        ++blocks_done;
-        if (!ok) std::fprintf(stderr, "error: writing frames failed\n");
-        return ok;
-    };
-    auto decode = [&](const float* latent, int n, std::vector<float>& px) -> bool {
-        auto td = Clock::now();
-        if (a.profile) bed.set_profile(true);
-        const bool ok = motion.decode(latent, n, px);
-        if (a.profile) bed.set_profile(false);
-        if (!ok) { std::fprintf(stderr, "error: decoder failed\n"); return false; }
-        const double dms = ms_since(td);
-        ms_decode += dms;
-        if (n == nb) decode_ms.push_back(dms);
-        return true;
-    };
-
-    // With overlap: a decoder thread and an output thread (uint8 conversion
-    // and frame writing), each fed by a queue of at most two blocks, so the
-    // sampler, the decoder and the output of three blocks run at once.
-    struct Job { std::vector<float> data; int n; };
-    struct Stage {
-        std::mutex mu;
-        std::condition_variable cv;
-        std::deque<Job> q;
-        bool closing = false;
-        bool push(Job&& j, const std::atomic<bool>& failed) {
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return q.size() < 2 || failed; });
-            if (failed) return false;
-            q.push_back(std::move(j));
-            cv.notify_all();
-            return true;
-        }
-        bool pop(Job& j) {
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return closing || !q.empty(); });
-            if (q.empty()) return false;
-            j = std::move(q.front());
-            q.pop_front();
-            cv.notify_all();
-            return true;
-        }
-        void close() {
-            std::lock_guard<std::mutex> lk(mu);
-            closing = true;
-            cv.notify_all();
-        }
-    };
-    Stage to_decode, to_output;
-    std::atomic<bool> failed{false};
-    auto fail = [&] {
-        failed = true;
-        to_decode.cv.notify_all();
-        to_output.cv.notify_all();
-    };
-    std::thread dec_thread, out_thread;
-    if (overlap) {
-        dec_thread = std::thread([&] {
-            Job job;
-            while (to_decode.pop(job)) {
-                if (failed) continue;
-                Job done{{}, job.n};
-                if (!decode(job.data.data(), job.n, done.data) || !to_output.push(std::move(done), failed)) fail();
-            }
-            to_output.close();
-        });
-        out_thread = std::thread([&] {
-            Job job;
-            while (to_output.pop(job))
-                if (!failed && !output(job.data, job.n)) fail();
-        });
-    }
-    auto submit = [&](const float* latent, int n) -> bool {
-        if (!overlap) return decode(latent, n, pixels) && output(pixels, n);
-        return to_decode.push(Job{std::vector<float>(latent, latent + (size_t)n * D), n}, failed);
-    };
-    auto finish = [&]() -> bool {
-        if (overlap) {
-            to_decode.close();
-            dec_thread.join();
-            out_thread.join();
-        }
-        return !failed;
-    };
-
-    // ---- primer: clip frames, no KV read; decoded in blocks of nb ----
-    window(0, clip, wa);
-    noise.next((size_t)clip * D, nz);
-    t0 = Clock::now();
-    if (!sampler.primer(wa.data(), nz.data(), x)) { std::fprintf(stderr, "error: primer failed\n"); finish(); return 1; }
-    ms_primer = ms_since(t0);
-    ms_sampler += ms_primer;
-    for (int b = 0; b < clip; b += nb)
-        if (!submit(x.data() + (size_t)b * D, std::min(nb, clip - b))) { finish(); return 1; }
-
-    // ---- steady blocks ----
-    std::vector<float> latent;
-    for (int t = clip; t < T; t += nb) {
-        window(t - ctx, ctx + nb, wa);
-        noise.next((size_t)nb * D, nz);
-        t0 = Clock::now();
-        if (!sampler.steady(wa.data(), nz.data(), latent)) {
-            std::fprintf(stderr, "error: steady block failed\n");
-            finish();
-            return 1;
-        }
-        const double ms = ms_since(t0);
-        ms_sampler += ms;
-        steady_ms.push_back(ms);
-        // The last block keeps only the frames the audio covers.
-        if (!submit(latent.data(), std::min(nb, T - t))) { finish(); return 1; }
-        if (!overlap) std::fprintf(stderr, "\rframes %d / %d", decoded, n_frames_out);
-    }
-    if (!finish()) return 1;
+    // ---- primer and steady blocks, decoder, output ----
+    gen.add_features(feats.data(), T);
+    if (!gen.finish(err)) { std::fprintf(stderr, "\nerror: %s\n", err.c_str()); return 1; }
     std::fprintf(stderr, "\n");
 
+    const af::GenStats& st = gen.stats();
+    double ms_out = st.ms_out;
     t0 = Clock::now();
-    if (!sink.close()) return 1;
+    if (!video.close(err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     ms_out += ms_since(t0);
     const double ms_gen = ms_since(t_gen);
     const double ms_total = ms_since(t_all);
+    const int decoded = st.frames;
 
-    size_t mem_free1 = 0;
+    size_t mem_free1 = 0, mem_total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(be.handle()), &mem_free1, &mem_total);
+    const size_t mem_free0 = engine.mem_free_before_load();
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     const double clip_s = decoded / (double)fps;
@@ -731,23 +351,24 @@ int run_generate(const Args& a) {
     if (!a.output.empty()) std::printf("output: %s\n", a.output.c_str());
     if (!a.frames_dir.empty()) std::printf("frames dir: %s\n", a.frames_dir.c_str());
     std::printf("timings (%s, %d threads):\n", be.device().c_str(), n_threads);
-    std::printf("  load            %9.1f ms\n", ms_load);
-    std::printf("  portrait encode %9.1f ms\n", ms_encode);
+    std::printf("  load            %9.1f ms\n", engine.load_ms());
+    std::printf("  portrait encode %9.1f ms\n", st.ms_encode);
     std::printf("  audio features  %9.1f ms  (%d frames)\n", ms_audio, T);
     std::printf("  sampler         %9.1f ms  (primer %.1f ms; steady %zu blocks, median %.1f ms/block)\n",
-                ms_sampler, ms_primer, steady_ms.size(), median(steady_ms));
+                st.ms_sampler, st.ms_primer, st.steady_ms.size(), median(st.steady_ms));
     std::printf("  decoder         %9.1f ms  (%.1f ms/frame; full %d-frame block median %.1f ms, %d frame(s) per graph)\n",
-                ms_decode, decoded ? ms_decode / decoded : 0.0, nb, median(decode_ms),
-                decode_batch > 0 ? decode_batch : nb);
+                st.ms_decode, decoded ? st.ms_decode / decoded : 0.0, nb, median(st.decode_ms),
+                engine.decode_batch() > 0 ? engine.decode_batch() : nb);
     std::printf("  uint8 + output  %9.1f ms\n", ms_out);
     std::printf("  generate        %9.1f ms  (encode + audio + sampler + decoder + output)\n", ms_gen);
     std::printf("  total           %9.1f ms  (with load)\n", ms_total);
-    std::printf("first block latency %.1f ms (primer + first decoded block)\n", ms_first_block);
+    std::printf("first block latency %.1f ms (primer + first decoded block)\n", st.ms_first_block);
     std::printf("steady blocks (%d frames each, %.0f ms of video): sampler median %.1f ms + decoder median %.1f ms "
                 "= %.1f ms; period between finished blocks median %.1f ms (%s)\n",
-                nb, 1000.0 * nb / fps, median(steady_ms), median(decode_ms), median(steady_ms) + median(decode_ms),
-                median(period_ms), overlap ? "decoder overlapped with the sampler" : "no overlap");
-    if (a.profile) bed.print_profile("decoder (all blocks)");
+                nb, 1000.0 * nb / fps, median(st.steady_ms), median(st.decode_ms),
+                median(st.steady_ms) + median(st.decode_ms), median(st.period_ms),
+                overlap ? "decoder overlapped with the sampler" : "no overlap");
+    if (a.profile) engine.decoder_backend().print_profile("decoder (all blocks)");
     std::printf("memory: peak RSS %.0f MB; device memory in use at the end %.0f MB (free %.0f -> %.0f MB of %.0f MB)\n",
                 ru.ru_maxrss / 1024.0, ((double)mem_free0 - (double)mem_free1) / 1048576.0, mem_free0 / 1048576.0,
                 mem_free1 / 1048576.0, mem_total / 1048576.0);

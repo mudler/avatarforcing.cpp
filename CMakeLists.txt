@@ -74,19 +74,25 @@ if(TARGET ggml-cuda)
 endif()
 
 add_library(avatarforcing STATIC
+    src/common.cpp
     src/backend.cpp
     src/model_loader.cpp
     src/flow.cpp
     src/sampler.cpp
     src/grid_sample.cpp
     src/motion.cpp
-    src/wav2vec2.cpp)
+    src/wav2vec2.cpp
+    src/audio_io.cpp
+    src/pipeline.cpp)
 # grid_sample.cpp reproduces the rounding of the PyTorch CPU kernel with
 # explicit fmaf calls; motion.cpp builds the base grids like numpy. Neither may
 # get extra fused multiply-adds from the compiler.
 set_source_files_properties(src/grid_sample.cpp src/motion.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
 target_include_directories(avatarforcing PUBLIC src)
+target_include_directories(avatarforcing SYSTEM PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/stb
+    ${PROJECT_SOURCE_DIR}/third_party/dr_libs)
 target_link_libraries(avatarforcing PUBLIC ggml)
 
 if(AVATARFORCING_BUILD_CLI)
