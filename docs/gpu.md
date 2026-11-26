@@ -85,8 +85,10 @@ a patch or the submodule commit changes.
 | fusion of `MUL` (per-channel scale), `ADD` (per-channel bias) and `LEAKY_RELU`, and of `ADD` and `LEAKY_RELU`; bit-identical to the separate kernels | `ggml-cuda/chan-affine.cu`, `ggml-cuda/ggml-cuda.cu` | `GGML_CUDA_FUSE_CHAN_AFFINE` |
 | no `-use_fast_math` for the CUDA sources | `ggml-cuda/CMakeLists.txt` | `GGML_CUDA_NO_FAST_MATH` |
 
-`patches/ggml-0002-decoder-kernels.patch` adds the decoder kernels
-(see "The decoder on the GPU" below) and two fixes:
+`patches/ggml-0002-block-reduce-sync.patch` (the `block_reduce` barrier) and
+`patches/ggml-0003-decoder-kernels.patch` (everything else in this table) add
+the decoder kernels (see "The decoder on the GPU" below), the op profiler,
+the stream priority and the fix of a race:
 
 | Change | Where | Switch |
 |---|---|---|
@@ -101,6 +103,10 @@ a patch or the submodule commit changes.
 The project CMake turns all switches on (`GGML_CUDA_NO_FAST_MATH` is a CMake
 variable, the others are compile definitions of the `ggml-cuda` target). Without them the stock ggml
 behaviour is unchanged, which keeps the patches small and easy to rebase.
+
+`patches/ggml-0004-sve-vec-dot-f32-tail.patch` fixes the SVE tail of the CPU
+F32 dot product (see "Fixed: the SVE dot product of the aarch64 CPU backend"
+below). It is a plain bug fix with no switch.
 
 ### grid_sample
 
@@ -435,17 +441,36 @@ the transposed convolution (one less pass over the largest tensor at each
 level), and the small 3-channel passes of the skip and flow upsampling
 (about 6 ms per block).
 
-## Known issue: the aarch64 CPU backend of an NVIDIA Thor
+## Fixed: the SVE dot product of the aarch64 CPU backend
 
-Built with `GGML_NATIVE=ON` on the CPU of an NVIDIA Thor, the ggml CPU backend gives
-wrong results in `test_flow_parity`, `test_sampler_parity` and
-`test_wav2vec2_parity` (errors of 15 to 90 % relative, starting at the first
-matrix product of two computed tensors: the attention scores of the
-condition embedder, the first wav2vec2 convolution); `test_motion_parity`
-passes. With `GGML_LLAMAFILE=OFF` the result is the same; with
-`GGML_NATIVE=OFF` all tests pass. The fault is in one of the native aarch64
-CPU kernels of the pinned ggml, not in this code, and the CUDA path does not
-use them. On such a machine build the CPU backend with `GGML_NATIVE=OFF`.
+Built with `GGML_NATIVE=ON` on the CPU of an NVIDIA Thor, the ggml CPU
+backend of the pinned ggml gave wrong results in `test_flow_parity`,
+`test_sampler_parity` and `test_wav2vec2_parity` (errors of 15 to 90 %
+relative, starting at the first wav2vec2 convolution and at the attention
+of the condition embedder); `test_motion_parity` passed.
+
+The native flags of this CPU enable SVE (128-bit vectors). A build with
+`-march=armv8.2-a+sve` alone fails the same way, and one with dotprod, fp16,
+i8mm and bf16 but no SVE passes, so the fault is in an SVE path. It is the
+tail of `ggml_vec_dot_f32` (`ggml-cpu/vec.cpp`), which handles the last
+`n % 4` elements with
+
+```
+sum1 = svmad_f32_m(pg, ax1, ay1, sum1);
+```
+
+`svmad_f32_m(pg, a, b, c)` returns `a * b + c` in the active lanes and `a`
+in the inactive ones. `ax1` is zero there, so the partial sums that `sum1`
+held in those lanes were dropped. Every F32 dot product whose length is not
+a multiple of 4 lost part of its sum: the first wav2vec2 convolution
+(length 10) and attention products whose length is the number of keys. The
+motion model has only lengths that are multiples of 4.
+
+`patches/ggml-0004-sve-vec-dot-f32-tail.patch` uses
+`svmla_f32_m(pg, sum1, ax1, ay1)`, which keeps `sum1` in the inactive
+lanes; the active lanes get the same fused multiply-add as before. With it
+all four tests pass on the CPU of an NVIDIA Thor with `GGML_NATIVE=ON` (and
+with `-march=armv8.2-a+sve`). The CUDA path does not use this kernel.
 
 ## Metal (not done)
 
