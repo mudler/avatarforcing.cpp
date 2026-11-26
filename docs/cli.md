@@ -2,7 +2,8 @@
 
 `avatarforcing-cli` turns a portrait and a speech recording into a lip-synced
 talking-head video. It runs the whole model in C++ on the ggml CPU or CUDA
-backend (`docs/gpu.md`) and calls `ffmpeg` to encode the mp4.
+backend (`docs/gpu.md`) and calls `ffmpeg` to encode the mp4. The C API
+(`docs/capi.md`) runs the same pipeline.
 
 ```sh
 avatarforcing-cli --model avatarforcing-f32.gguf --portrait portrait512.png \

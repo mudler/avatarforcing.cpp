@@ -1,0 +1,6 @@
+{
+  global:
+    avatarforcing_*;
+  local:
+    *;
+};

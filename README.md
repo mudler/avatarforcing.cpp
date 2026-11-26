@@ -27,6 +27,7 @@ The model has three parts:
 | M5 | wav2vec2 audio features (raw and normalized input), idle features, audio projection, parity-gated | done |
 | M6 | `avatarforcing-cli`: portrait + speech WAV to mp4, end-to-end gate against the upstream streaming path | done |
 | M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; faster than real time on an NVIDIA Thor (one 400 ms block every 202 ms at nfe 6, 241 ms at nfe 10) | done |
+| M8 | C API: `libavatarforcing` with `include/avatarforcing.h`, offline generation to RGB frames or mp4, streaming sessions; the CLI and the API share one pipeline | done |
 
 The C++ library holds all three parts in F32 on the ggml CPU or CUDA backend
 (`docs/gpu.md`): the
@@ -50,6 +51,29 @@ and channel count. `ffmpeg` must be on `PATH` for the mp4 output;
 describes all options, the pipeline and how it differs from the upstream
 code.
 
+## C API
+
+`libavatarforcing.so` exports a flat C API (`include/avatarforcing.h`) for
+programs that load the library at run time, for example Go with purego or
+Python with ctypes:
+
+```c
+char* err = NULL;
+avatarforcing_ctx* ctx = avatarforcing_load("avatarforcing-f32.gguf", "{\"backend\": \"cpu\"}", &err);
+uint8_t* frames = NULL;
+int n = 0, w = 0, h = 0, fps = 0;
+avatarforcing_generate_frames(ctx, "portrait512.png", "speech.wav", "{\"nfe\": 6}",
+                              &frames, &n, &w, &h, &fps);
+avatarforcing_free_frames(frames);
+avatarforcing_free(ctx);
+```
+
+It generates RGB frames or an mp4 file from a portrait and a WAV file or
+float PCM, and has sessions that take the audio phrase by phrase. The CLI
+and the API run the same pipeline (`src/pipeline.cpp`), so they give the
+same frames. `docs/capi.md` describes the functions, the options, the
+sessions and the thread rules.
+
 ## Build and test
 
 ggml is a git submodule (`third_party/ggml`, pinned at v0.15.2).
@@ -60,8 +84,11 @@ cmake -B build -DGGML_NATIVE=ON
 cmake --build build -j8
 ```
 
-The tool is `build/examples/cli/avatarforcing-cli`. stb_image, stb_image_write
-and dr_wav are vendored under `third_party/`.
+The tool is `build/examples/cli/avatarforcing-cli` and the library
+`build/libavatarforcing.so` (`-DAVATARFORCING_BUILD_SHARED=OFF` skips it).
+CMake builds ggml as static libraries inside the library and the tool;
+`-DBUILD_SHARED_LIBS=ON` links them as shared libraries instead.
+stb_image, stb_image_write and dr_wav are vendored under `third_party/`.
 
 For the CUDA backend add `-DGGML_CUDA=ON` (and `-DCMAKE_CUDA_ARCHITECTURES=...`
 for your GPU) and run the tool with `--backend cuda`; see `docs/gpu.md`.
@@ -91,7 +118,7 @@ ctest --test-dir build --output-on-failure
 
 `test_flow_parity` and `test_sampler_parity` read the flow baseline,
 `test_motion_parity` the motion baseline and `test_wav2vec2_parity` the
-wav2vec2 baseline.
+wav2vec2 baseline. `test_capi` needs only the model GGUF (`docs/capi.md`).
 
 ## Reference tooling
 

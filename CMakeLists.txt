@@ -9,6 +9,15 @@ endif()
 
 option(AVATARFORCING_BUILD_TESTS "Build ctest targets" ON)
 option(AVATARFORCING_BUILD_CLI "Build the avatarforcing-cli tool" ON)
+option(AVATARFORCING_BUILD_SHARED "Build libavatarforcing, the shared library with the C API" ON)
+
+# The shared library holds ggml, so that it loads with dlopen and nothing
+# else: ggml is built as static libraries with position-independent code,
+# unless BUILD_SHARED_LIBS is set. The library exports only the C API.
+if(AVATARFORCING_BUILD_SHARED)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "build ggml as shared libraries")
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # -march=native (GGML_NATIVE) and tinyBLAS SGEMM (GGML_LLAMAFILE) are free
 # speedups on the CPU backend. Use -DGGML_NATIVE=OFF for portable binaries.
@@ -89,11 +98,38 @@ add_library(avatarforcing STATIC
 # get extra fused multiply-adds from the compiler.
 set_source_files_properties(src/grid_sample.cpp src/motion.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
-target_include_directories(avatarforcing PUBLIC src)
+target_include_directories(avatarforcing PUBLIC src include)
 target_include_directories(avatarforcing SYSTEM PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/stb
     ${PROJECT_SOURCE_DIR}/third_party/dr_libs)
 target_link_libraries(avatarforcing PUBLIC ggml)
+set_target_properties(avatarforcing PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+
+# libavatarforcing: the C API (include/avatarforcing.h). See docs/capi.md.
+if(AVATARFORCING_BUILD_SHARED)
+  add_library(avatarforcing_shared SHARED src/capi.cpp)
+  target_include_directories(avatarforcing_shared PUBLIC include)
+  target_compile_definitions(avatarforcing_shared PRIVATE AVATARFORCING_BUILD)
+  target_link_libraries(avatarforcing_shared PRIVATE avatarforcing)
+  set_target_properties(avatarforcing_shared PROPERTIES
+      OUTPUT_NAME avatarforcing
+      CXX_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN ON)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Export only avatarforcing_*: the static ggml and the C++ code stay
+    # local to the library.
+    target_link_options(avatarforcing_shared PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/avatarforcing.map"
+        "LINKER:--no-undefined")
+    set_property(TARGET avatarforcing_shared APPEND PROPERTY LINK_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/avatarforcing.map)
+  endif()
+  install(TARGETS avatarforcing_shared LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+  install(FILES include/avatarforcing.h DESTINATION include)
+endif()
 
 if(AVATARFORCING_BUILD_CLI)
   add_subdirectory(examples/cli)
