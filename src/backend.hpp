@@ -62,9 +62,10 @@ public:
                  const std::function<void(Graph&)>& read);
 
     // Profiling (AVATARFORCING_PROFILE=1 or set_profile(true)): compute()
-    // runs the graph one node at a time, synchronizes after each node and
-    // accumulates the time per op and per output width. Only for analysis:
-    // it disables kernel fusion and adds a sync per node.
+    // accumulates the time per op and per output width. On the patched CUDA
+    // backend every kernel launch (a node or a fused group of nodes) is
+    // timed with CUDA events, with CUDA graphs off; on other backends the
+    // graph runs one node at a time with a sync after each node (no fusion).
     void set_profile(bool on) { profile_ = on; }
     void reset_profile() { prof_.clear(); }
     void print_profile(const char* title) const;
@@ -72,6 +73,7 @@ public:
 private:
     bool check_ops(ggml_cgraph* gf) const;
     bool compute_profiled(ggml_cgraph* gf);
+    bool compute_op_profiled(ggml_cgraph* gf, bool& ok);
 
     ggml_backend_t backend_ = nullptr;
     ggml_gallocr_t galloc_ = nullptr;

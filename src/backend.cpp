@@ -106,7 +106,35 @@ bool Backend::check_ops(ggml_cgraph* gf) const {
     return false;
 }
 
+// Profile through the op profiler of the patched CUDA backend: the whole
+// graph runs as usual (with kernel fusion, without CUDA graphs) and every
+// kernel launch, a single node or a fused group, is timed with CUDA events.
+// Returns false (and runs nothing) when the backend has no such profiler.
+bool Backend::compute_op_profiled(ggml_cgraph* gf, bool& ok) {
+    using EnableFn = void (*)(ggml_backend_t, bool);
+    using ReadFn = void (*)(ggml_backend_t, void (*)(void*, const char*, double, long), void*);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_));
+    if (!reg) return false;
+    auto enable = (EnableFn)ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_op_profile_enable");
+    auto read = (ReadFn)ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_op_profile_read");
+    if (!enable || !read) return false;
+    enable(backend_, true);
+    ok = ggml_backend_graph_compute(backend_, gf) == GGML_STATUS_SUCCESS;
+    ggml_backend_synchronize(backend_);
+    enable(backend_, false);
+    read(backend_, [](void* ud, const char* key, double ms, long count) {
+        auto* prof = (std::vector<ProfEntry>*)ud;
+        auto it = std::find_if(prof->begin(), prof->end(), [&](const ProfEntry& e) { return e.key == key; });
+        if (it == prof->end()) { prof->push_back({key, 0, 0}); it = prof->end() - 1; }
+        it->ms += ms;
+        it->count += count;
+    }, &prof_);
+    return true;
+}
+
 bool Backend::compute_profiled(ggml_cgraph* gf) {
+    bool op_ok = false;
+    if (compute_op_profiled(gf, op_ok)) return op_ok;
     using Clock = std::chrono::steady_clock;
     ggml_init_params p = { ggml_graph_overhead_custom(1, false) + 1024, nullptr, true };
     ggml_context* pctx = ggml_init(p);
@@ -152,8 +180,8 @@ void Backend::print_profile(const char* title) const {
     std::sort(ops.begin(), ops.end(), [](auto& a, auto& b) { return a.second > b.second; });
     std::printf("  by op:\n");
     for (auto& o : ops) std::printf("    %-16s %9.2f ms  %5.1f %%\n", o.first.c_str(), o.second, 100.0 * o.second / total);
-    std::printf("  by op and output width (top 30):\n");
-    for (size_t i = 0; i < v.size() && i < 30; ++i)
+    std::printf("  by op and output width (top 40):\n");
+    for (size_t i = 0; i < v.size() && i < 40; ++i)
         std::printf("    %s %9.2f ms  %5ld nodes  %5.1f %%\n", v[i].key.c_str(), v[i].ms, v[i].count,
                     100.0 * v[i].ms / total);
 }
