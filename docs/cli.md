@@ -167,10 +167,13 @@ phrase, and the tool prints the frame where it starts.
 The mp4 has the frames of the whole call. Its audio track holds each phrase
 at its start frame, cut at the interrupts. wav2vec2 gets the raw PCM
 (`--audio-mode raw`) unless `--audio-mode` says otherwise. At the end the
-tool prints the step time per block, for idle blocks and for blocks with
-speech, and the session statistics. With `--realtime` it waits for the time
+tool prints the time from the start of the session to the first frame,
+the step time per block, for idle blocks and for blocks with speech, and
+the session statistics. With `--realtime` it waits for the time
 of each block, as a live caller does, and counts the blocks that were not
-ready in time.
+ready in time. The writer runs in the same loop, so the count includes the
+output time: `--frames-dir` writes PNG files at about 50 ms per frame and
+makes most blocks late. Use `-o` for a meaningful count.
 
 ## End-to-end gate
 

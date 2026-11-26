@@ -499,6 +499,8 @@ int run_live(const Args& a) {
     lo.queue_blocks = a.queue_blocks;
     af::LiveSession live(engine, go, lo);
     auto t0 = Clock::now();
+    const auto t_open = t0;
+    double ms_first_frame = -1;
     if (!live.open(image.data(), err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     const double ms_open = ms_since(t0);
     std::fprintf(stderr, "live: %lld frames (%.2f s), nfe %d, %s audio, open (portrait + hidden primer) %.0f ms\n",
@@ -521,6 +523,7 @@ int run_live(const Args& a) {
                 return false;
             }
         }
+        if (written == 0 && n > 0) ms_first_frame = ms_since(t_open);
         if (video.is_open() && !video.write(p, n, err)) return false;
         written += n;
         return true;
@@ -625,6 +628,8 @@ int run_live(const Args& a) {
     if (!a.frames_dir.empty()) std::printf("frames dir: %s\n", a.frames_dir.c_str());
     std::printf("open: %.1f ms (portrait encoder and hidden primer, primer %.1f ms)\n", ms_open,
                 live.generator().stats().ms_primer);
+    std::printf("first frame: %.1f ms after the start of open (open, first step, first decoded block)\n",
+                ms_first_frame);
     std::printf("step time per block (%s, %d threads, %s; budget %.0f ms):\n", engine.backend().device().c_str(),
                 engine.n_threads(), engine.overlap() ? "decoder overlapped" : "no overlap", 1000.0 * nb / fps);
     stat(idle_ms, "idle");
