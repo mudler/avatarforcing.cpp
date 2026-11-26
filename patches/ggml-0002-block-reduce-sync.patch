@@ -1,0 +1,19 @@
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index f5bb14dd..840c274b 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -633,6 +633,14 @@ static __device__ T block_reduce(T val, T * shared_vals) {
+         if (lane_id < (static_cast<int>(block_size) / WARP_SIZE)) {
+             val = shared_vals[lane_id];
+         }
++#ifdef GGML_CUDA_BLOCK_REDUCE_SYNC
++        // Callers reduce twice in a row into the same buffer (soft_max: the
++        // max, then the sum; group_norm: the mean, then the variance). Without
++        // this barrier a fast warp writes its next partial into shared_vals
++        // while a slow warp still reads the previous result from it, and the
++        // slow warp continues with a wrong value.
++        __syncthreads();
++#endif
+         return block_reduce_policy<reduce_method_t, T>::reduce(val);
+     }
+ 

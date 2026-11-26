@@ -61,12 +61,14 @@ if(NOT AF_GGML_OLD_STAMP STREQUAL AF_GGML_STAMP_VALUE)
   file(WRITE ${AF_GGML_STAMP_FILE} "${AF_GGML_STAMP_VALUE}")
 endif()
 # CUDA in strict float32 (see patches/): no -use_fast_math, no TF32 GEMMs,
-# two-pass LayerNorm statistics; plus the implicit-GEMM convolution kernel.
+# two-pass LayerNorm statistics, a race-free block reduction; plus the
+# implicit-GEMM convolution kernel.
 set(GGML_CUDA_NO_FAST_MATH ON)
 add_subdirectory(${AF_GGML_PATCHED} ggml)
 if(TARGET ggml-cuda)
   target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_NO_TF32 GGML_CUDA_NORM_TWO_PASS GGML_CUDA_CONV2D_IGEMM
-                                                     GGML_CUDA_FUSE_CHAN_AFFINE GGML_CUDA_CONV2D_DW_TILED)
+                                                     GGML_CUDA_FUSE_CHAN_AFFINE GGML_CUDA_CONV2D_DW_TILED
+                                                     GGML_CUDA_BLOCK_REDUCE_SYNC)
 endif()
 
 add_library(avatarforcing STATIC
