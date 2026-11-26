@@ -19,6 +19,10 @@ set_tests_properties(test_motion_parity PROPERTIES LABELS "model" TIMEOUT 1800)
 af_add_test(test_wav2vec2_parity)
 set_tests_properties(test_wav2vec2_parity PROPERTIES LABELS "model" TIMEOUT 1800)
 
+# Quantized GGUF against the F32 GGUF (AVATARFORCING_TEST_QUANT_GGUF).
+af_add_test(test_quant)
+set_tests_properties(test_quant PROPERTIES LABELS "model" TIMEOUT 1800)
+
 # Live mode feature schedule; needs no model.
 af_add_test(test_live_schedule)
 

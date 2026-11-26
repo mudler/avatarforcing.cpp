@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(AVATARFORCING_BUILD_TESTS "Build ctest targets" ON)
-option(AVATARFORCING_BUILD_CLI "Build the avatarforcing-cli tool" ON)
+option(AVATARFORCING_BUILD_CLI "Build the avatarforcing-cli and avatarforcing-quantize tools" ON)
 option(AVATARFORCING_BUILD_SHARED "Build libavatarforcing, the shared library with the C API" ON)
 
 # The shared library holds ggml, so that it loads with dlopen and nothing
@@ -86,6 +86,7 @@ add_library(avatarforcing STATIC
     src/common.cpp
     src/backend.cpp
     src/model_loader.cpp
+    src/quant_policy.cpp
     src/flow.cpp
     src/sampler.cpp
     src/grid_sample.cpp
@@ -134,6 +135,7 @@ endif()
 
 if(AVATARFORCING_BUILD_CLI)
   add_subdirectory(examples/cli)
+  add_subdirectory(examples/quantize)
 endif()
 
 if(AVATARFORCING_BUILD_TESTS)

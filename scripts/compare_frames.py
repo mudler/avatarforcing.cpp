@@ -7,8 +7,9 @@ the reference frames of reference_stream.py) frame by frame.
 
 Per frame: SSIM (Wang et al. 2004: Gaussian window 11, sigma 1.5, valid
 region, on [0, 1] images, mean over the 3 channels; the same SSIM as
-tests/test_motion_parity.cpp), the largest absolute pixel difference and
-the mean absolute difference, both in uint8 levels. The exit status is 1
+tests/test_motion_parity.cpp), PSNR in dB over all pixels and channels
+(peak 255; identical frames count as 100 dB), the largest absolute pixel
+difference and the mean absolute difference, both in uint8 levels. The exit status is 1
 when the frame counts differ or a frame is below --min-ssim.
 """
 from __future__ import annotations
@@ -73,20 +74,24 @@ def main():
             print(f"frame {i}: shape {a.shape} vs {b.shape}")
             sys.exit(1)
         d = np.abs(a.astype(np.int16) - b.astype(np.int16))
-        rows.append((i, ssim(a, b), int(d.max()), float(d.mean())))
+        mse = float(np.mean(d.astype(np.float64) ** 2))
+        psnr = 100.0 if mse == 0 else min(100.0, 10.0 * np.log10(255.0 ** 2 / mse))
+        rows.append((i, ssim(a, b), int(d.max()), float(d.mean()), psnr))
 
     s = np.array([r[1] for r in rows])
+    p = np.array([r[4] for r in rows])
     mx = max(r[2] for r in rows)
     mean_abs = float(np.mean([r[3] for r in rows]))
     worst = int(np.argmin(s))
     n_fail = int((s < args.min_ssim).sum())
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("frame,ssim,max_abs_diff,mean_abs_diff\n")
+            f.write("frame,ssim,psnr_db,max_abs_diff,mean_abs_diff\n")
             for r in rows:
-                f.write(f"{r[0]},{r[1]:.6f},{r[2]},{r[3]:.4f}\n")
+                f.write(f"{r[0]},{r[1]:.6f},{r[4]:.2f},{r[2]},{r[3]:.4f}\n")
     print(f"frames: {len(rows)}")
     print(f"SSIM: min {s.min():.6f} (frame {worst}), mean {s.mean():.6f}, max {s.max():.6f}")
+    print(f"PSNR: min {p.min():.2f} dB (frame {int(np.argmin(p))}), mean {p.mean():.2f} dB")
     print(f"pixel diff (uint8 levels): max {mx}, mean {mean_abs:.4f}")
     print(f"gate SSIM >= {args.min_ssim}: {'PASS' if n_fail == 0 else f'FAIL ({n_fail} frames below)'}")
     sys.exit(0 if n_fail == 0 else 1)
