@@ -21,6 +21,12 @@
 
 namespace af {
 
+// The fade after a reanchor. Latent: the decoder input moves from the old
+// motion to the new one (Generator::latent_fade_weight), so every frame is
+// one face. Pixel: the live app's RGB cross-fade from the last frame
+// (crossfade()), which shows two faces at once when the pose changed.
+enum class ReanchorFade { Latent, Pixel, None };
+
 struct LiveOptions {
     int queue_blocks = 3;        // blocks that may wait for pull_frames, >= 1
     int max_ahead_seconds = 30;  // a phrase must end at most this far after next()
@@ -28,7 +34,8 @@ struct LiveOptions {
     // app value (112, 162, 25).
     int reanchor_every = -1;        // steady blocks before an idle reanchor; 0: none
     int reanchor_max_defer = -1;    // steady blocks before a forced reanchor; 0: none
-    int reanchor_fade_frames = -1;  // cross-fade frames after a reanchor; 0: no fade
+    int reanchor_fade_frames = -1;  // fade frames after a reanchor; 0: no fade
+    ReanchorFade reanchor_fade = ReanchorFade::Latent;
     // false: the reanchor block is the decoded end of the new primer. true:
     // it repeats the last frame, as the live app does (it skips the output of
     // the reanchor because its primer takes longer than a block there).

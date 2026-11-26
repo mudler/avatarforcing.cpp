@@ -333,6 +333,16 @@ bool request_options(avatarforcing_ctx* ctx, const char* json, af::GenOptions& g
             live_keys = true;
             continue;
         }
+        if (session && k == "live_reanchor_fade") {
+            std::string m;
+            if (!as_string(k, kv.second, m, err)) return false;
+            if (m == "latent") session->lo.reanchor_fade = af::ReanchorFade::Latent;
+            else if (m == "pixel") session->lo.reanchor_fade = af::ReanchorFade::Pixel;
+            else if (m == "none") session->lo.reanchor_fade = af::ReanchorFade::None;
+            else { err = "option \"live_reanchor_fade\" must be \"latent\", \"pixel\" or \"none\""; return false; }
+            live_keys = true;
+            continue;
+        }
         if (session && k == "live_reanchor_hold") {
             if (!as_bool(k, kv.second, session->lo.reanchor_hold, err)) return false;
             live_keys = true;

@@ -436,6 +436,7 @@ bool Generator::output(const std::vector<float>& px, int n, std::string& err) {
 }
 
 bool Generator::submit(const float* latent, int n, std::string& err) {
+    if (n > 0) last_latent_.assign(latent + (size_t)(n - 1) * D_, latent + (size_t)n * D_);
     if (!threads_) return decode(latent, n, pixels_, err) && output(pixels_, n, err);
     if (!to_decode_.push(Job{std::vector<float>(latent, latent + (size_t)n * D_), n}, failed_))
         return failed_error(err);
@@ -450,6 +451,21 @@ bool Generator::submit_hold(int n, std::string& err) {
     }
     if (!to_decode_.push(Job{{}, n}, failed_)) return failed_error(err);
     return true;
+}
+
+float Generator::latent_fade_weight(int k, int total) {
+    return (float)(0.5 * (1.0 + std::cos(3.14159265358979323846 * (k + 1) / (double)(total + 1))));
+}
+
+void Generator::apply_fade(float* latent, int n, bool primer_rows) {
+    for (int j = 0; j < n && fade_i_ < fade_total_; ++j, ++fade_i_) {
+        const float w = latent_fade_weight(fade_i_, fade_total_);
+        float* row = latent + (size_t)j * D_;
+        for (int d = 0; d < D_; ++d) {
+            const float ref = primer_rows ? row[d] : fade_ref_[d];
+            row[d] += w * (fade_old_[d] - ref);
+        }
+    }
 }
 
 bool Generator::run(bool final, std::string& err) {
@@ -533,12 +549,18 @@ bool Generator::steady_block(const float* wa, std::string& err) {
     const double ms = ms_since(t0);
     stats_.ms_sampler += ms;
     stats_.steady_ms.push_back(ms);
-    if (!submit(latent_.data(), nb_, err)) return false;
+    const float* lat = latent_.data();
+    if (fade_i_ < fade_total_) {   // a motion fade after a reanchor
+        fade_lat_ = latent_;
+        apply_fade(fade_lat_.data(), nb_, false);
+        lat = fade_lat_.data();
+    }
+    if (!submit(lat, nb_, err)) return false;
     t_ += nb_;
     return true;
 }
 
-bool Generator::reanchor_block(const float* wa, bool emit, std::string& err) {
+bool Generator::reanchor_block(const float* wa, bool emit, int latent_fade, std::string& err) {
     if (!primed_) { err = "reanchor before the primer"; return false; }
     if (failed_) return failed_error(err);
     if (cancel_ && cancel_->load()) { err = "cancelled"; return false; }
@@ -549,7 +571,22 @@ bool Generator::reanchor_block(const float* wa, bool emit, std::string& err) {
     const double ms = ms_since(t0);
     stats_.ms_sampler += ms;
     stats_.reanchor_ms.push_back(ms);
-    const bool ok = emit ? submit(x_.data() + (size_t)(clip_ - nb_) * D_, nb_, err) : submit_hold(nb_, err);
+    // The fade starts at the first frame from the new caches: this block,
+    // or the block after a held one (latent_fade_weight).
+    fade_i_ = fade_total_ = 0;
+    if (latent_fade > 0 && (int)last_latent_.size() == D_) {
+        fade_old_ = last_latent_;
+        fade_ref_.assign(x_.begin() + (size_t)(clip_ - 1) * D_, x_.begin() + (size_t)clip_ * D_);
+        fade_total_ = latent_fade;
+    }
+    bool ok;
+    if (emit) {
+        fade_lat_.assign(x_.begin() + (size_t)(clip_ - nb_) * D_, x_.begin() + (size_t)clip_ * D_);
+        apply_fade(fade_lat_.data(), nb_, true);
+        ok = submit(fade_lat_.data(), nb_, err);
+    } else {
+        ok = submit_hold(nb_, err);
+    }
     if (!ok) return false;
     t_ += nb_;
     return true;

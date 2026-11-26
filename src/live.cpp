@@ -133,6 +133,7 @@ LiveSession::LiveSession(Engine& e, const GenOptions& go, const LiveOptions& lo,
     policy_.every = lo_.reanchor_every < 0 ? (int)fc.reanchor_every : lo_.reanchor_every;
     policy_.max_defer = lo_.reanchor_max_defer < 0 ? (int)fc.reanchor_max_defer : lo_.reanchor_max_defer;
     fade_frames_ = lo_.reanchor_fade_frames < 0 ? (int)fc.reanchor_fade_frames : lo_.reanchor_fade_frames;
+    if (lo_.reanchor_fade == ReanchorFade::None) fade_frames_ = 0;
 }
 
 LiveSession::~LiveSession() {
@@ -292,9 +293,12 @@ int64_t LiveSession::step(std::string& err) {
         std::lock_guard<std::mutex> qlk(q_mu_);
         produced_ += nb_;
         // The fade starts with the first frame that comes from the new caches.
-        if (reanchor && fade_frames_ > 0) fades_.push_back(hold ? t + nb_ : t);
+        if (reanchor && fade_frames_ > 0 && lo_.reanchor_fade == ReanchorFade::Pixel)
+            fades_.push_back(hold ? t + nb_ : t);
     }
-    const bool ok = reanchor ? gen_->reanchor_block(wa_.data(), !hold, err) : gen_->steady_block(wa_.data(), err);
+    const int latent_fade = lo_.reanchor_fade == ReanchorFade::Latent ? fade_frames_ : 0;
+    const bool ok = reanchor ? gen_->reanchor_block(wa_.data(), !hold, latent_fade, err)
+                             : gen_->steady_block(wa_.data(), err);
     if (!ok) {
         set_failed(err);
         return -1;
@@ -371,12 +375,15 @@ std::string LiveSession::stats_json() {
                   "\"queue_full\":%lld,\"phrases\":%lld,\"dropped_phrases\":%lld,\"interrupts\":%lld,"
                   "\"last_step_ms\":%.1f,\"max_step_ms\":%.1f,\"reanchors\":%lld,\"last_reanchor_frame\":%lld,"
                   "\"blocks_since_reanchor\":%d,\"reanchor_every\":%d,\"reanchor_max_defer\":%d,"
-                  "\"reanchor_fade_frames\":%d,\"last_reanchor_ms\":%.1f,\"max_reanchor_ms\":%.1f}",
+                  "\"reanchor_fade_frames\":%d,\"reanchor_fade\":\"%s\",\"last_reanchor_ms\":%.1f,"
+                  "\"max_reanchor_ms\":%.1f}",
                   (long long)sched_.next(), (long long)sched_.speech_end(), sched_.pending_phrases(),
                   (long long)queued, ready, queue_cap_, (long long)blocks_, (long long)speech_blocks_,
                   (long long)queue_full_, (long long)phrases_, (long long)dropped_, (long long)interrupts_,
                   last_step_ms_, max_step_ms_, (long long)reanchors_, (long long)last_reanchor_, policy_.since,
-                  policy_.every, policy_.max_defer, fade_frames_, last_reanchor_ms_, max_reanchor_ms_);
+                  policy_.every, policy_.max_defer, fade_frames_,
+                  fade_frames_ == 0 ? "none" : lo_.reanchor_fade == ReanchorFade::Pixel ? "pixel" : "latent",
+                  last_reanchor_ms_, max_reanchor_ms_);
     return buf;
 }
 

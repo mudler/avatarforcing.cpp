@@ -6,9 +6,12 @@
 //     forced at max_defer, and on request;
 //   - the frames before the first reanchor are the frames of a session with
 //     no reanchor (bit-identical);
-//   - the cross-fade is continuous: no step between frames in a fade is
-//     larger than 1.25 times the largest step elsewhere in the call; a held
-//     reanchor block repeats the last frame;
+//   - the fade is continuous: the step into the default motion fade, and
+//     every step in the live app's pixel fade, is at most 1.25 times the
+//     largest step elsewhere in the call; no step in the motion fade is
+//     larger than that or 0.3 times the jump with no fade (a pose change
+//     becomes a short head movement); a held reanchor block repeats the
+//     last frame, and a pixel fade starts with a copy of it;
 //   - determinism: the same call twice gives the same frames.
 // With AVATARFORCING_TEST_DRIFT_SECONDS=N (for example 120), a long idle call
 // of N s runs with the default policy and with no reanchor, and the test
@@ -208,10 +211,13 @@ static double max_step(const std::vector<Frame>& f, int lo, int hi) {
     return m;
 }
 
-// A fade step may be this much larger than the largest step elsewhere: the
-// motion of the face goes on under the fade, and the per-block 8-bit
-// scaling makes small steps at block edges.
+// A seam step may be this much larger than the largest step elsewhere: the
+// per-block 8-bit scaling makes small steps at block edges.
 static const double kMotionSlack = 1.25;
+
+// The largest step in a motion fade may be this fraction of the jump with
+// no fade: the fade spreads a pose change over its 25 frames.
+static const double kSpread = 0.3;
 
 static std::string list(const std::vector<int64_t>& v) {
     std::string s;
@@ -323,33 +329,55 @@ int main() {
     std::printf("no reanchor: frames 0..29 %s, frames 30..39 %s\n", same_before ? "identical" : "DIFFER",
                 differ_after ? "differ" : "SAME");
 
-    // ---- continuity of the cross-fade ----
-    if (a.frames.size() == 90) {
-        double fade = 0, rest = 0;
-        for (int i = 1; i < 90; ++i) {
-            const double d = mean_abs(a.frames[i].data(), a.frames[i - 1].data(), fb);
-            const bool in_fade = (i >= 30 && i < 30 + 25) || (i >= 70 && i < 70 + 25);
-            (in_fade ? fade : rest) = std::max(in_fade ? fade : rest, d);
-        }
-        std::printf("continuity: largest step between frames %.3f in the fades, %.3f elsewhere (0..255)\n", fade, rest);
-        CHECK(fade <= kMotionSlack * rest, "a fade step of %.3f is larger than the motion elsewhere (%.3f)", fade, rest);
-    }
-    // The jump that the fade hides: the same call with no fade.
+    // ---- continuity of the motion fade ----
+    // The same call with no fade gives the jump that the fade hides at each
+    // reanchor. The motion fade moves the face from the old pose to the new
+    // one over 25 frames, so a large pose change becomes a short head
+    // movement: the steps inside the fade can be larger than idle motion,
+    // but the step into the fade must look like normal motion, and the
+    // jump must be spread out.
     {
     af::LiveOptions nofade = fast;
     nofade.reanchor_fade_frames = 0;
-    const CallResult c = run_call(e, go, nofade, image, 4, {});
-    if (c.ok && c.frames.size() == 40) {
-        CHECK(c.reanchors == std::vector<int64_t>({30}), "no fade reanchors: %s", list(c.reanchors).c_str());
-        const double jump = mean_abs(c.frames[30].data(), c.frames[29].data(), fb);
-        std::printf("no fade: step at the reanchor (frame 29 to 30) %.3f, largest step in frames 1..29 %.3f\n", jump,
-                    max_step(c.frames, 1, 30));
-        // The fade starts with the frame before the reanchor, and the frames
-        // before the reanchor do not depend on the fade.
-        CHECK(a.frames.size() == 90 && a.frames[30] == a.frames[29], "fade frame 30 is not frame 29");
+    const CallResult c = run_call(e, go, nofade, image, 9, {});
+    CHECK(c.ok && c.reanchors == std::vector<int64_t>({30, 70}), "no fade reanchors: %s", list(c.reanchors).c_str());
+    if (c.ok && c.frames.size() == 90 && a.frames.size() == 90) {
+        // The frames before the first reanchor do not depend on the fade.
         bool same = true;
         for (int f = 0; f < 30; ++f) same = same && a.frames[f] == c.frames[f];
         CHECK(same, "the fade changed the frames before the reanchor");
+        double rest = 0;
+        for (int i = 1; i < 90; ++i)
+            if (!((i >= 30 && i < 55) || (i >= 70 && i < 95)))
+                rest = std::max(rest, mean_abs(a.frames[i].data(), a.frames[i - 1].data(), fb));
+        for (int t : {30, 70}) {
+            const double jump = mean_abs(c.frames[t].data(), c.frames[t - 1].data(), fb);
+            const double entry = mean_abs(a.frames[t].data(), a.frames[t - 1].data(), fb);
+            const double fade = max_step(a.frames, t, std::min(90, t + 25));
+            std::printf("continuity at %d: step %.3f with no fade; with the motion fade %.3f into the fade, %.3f at "
+                        "most in it; %.3f at most outside the fades (0..255)\n", t, jump, entry, fade, rest);
+            CHECK(entry <= kMotionSlack * rest, "the step into the fade at %d is %.3f, the motion elsewhere %.3f", t,
+                  entry, rest);
+            CHECK(fade <= std::max(kMotionSlack * rest, kSpread * jump),
+                  "a step of %.3f in the fade at %d (jump %.3f, motion elsewhere %.3f)", fade, t, jump, rest);
+        }
+    }
+    }
+    // The live app's pixel fade: it starts with a copy of the frame before
+    // the reanchor.
+    {
+    af::LiveOptions pixel = fast;
+    pixel.reanchor_fade = af::ReanchorFade::Pixel;
+    const CallResult p = run_call(e, go, pixel, image, 4, {});
+    if (p.ok && p.frames.size() == 40) {
+        CHECK(p.frames[30] == p.frames[29], "pixel fade frame 30 is not frame 29");
+        bool same = true;
+        for (int f = 0; f < 30; ++f) same = same && a.frames[f] == p.frames[f];
+        CHECK(same, "the pixel fade changed the frames before the reanchor");
+        const double fade = max_step(p.frames, 30, 40), rest = max_step(p.frames, 1, 30);
+        std::printf("pixel fade: largest step %.3f in frames 30..39, %.3f in frames 1..29\n", fade, rest);
+        CHECK(fade <= kMotionSlack * rest, "a pixel fade step of %.3f is larger than the motion elsewhere (%.3f)", fade,
+              rest);
     }
     }
 
@@ -365,15 +393,18 @@ int main() {
     CHECK(d.ok && d.reanchors == std::vector<int64_t>({50, 90}), "speech reanchors: %s", list(d.reanchors).c_str());
     std::printf("D speech (hold): reanchors at %s\n", list(d.reanchors).c_str());
     if (d.ok && d.frames.size() == 110) {
-        // Held block: frames 50..59 repeat frame 49; the fade starts at 60
-        // with frame 49 again (alpha 1).
+        // Held block: frames 50..59 repeat frame 49; the fade starts at 60.
         bool held = true;
-        for (int f = 50; f <= 60; ++f) held = held && d.frames[f] == d.frames[49];
-        CHECK(held, "frames 50..60 do not repeat frame 49");
-        const double fade = std::max(max_step(d.frames, 61, 85), max_step(d.frames, 101, 110));
+        for (int f = 50; f < 60; ++f) held = held && d.frames[f] == d.frames[49];
+        CHECK(held, "frames 50..59 do not repeat frame 49");
+        // Seams: into the first fade frames (60, 100).
+        double seam = 0;
+        for (int i : {60, 100}) seam = std::max(seam, mean_abs(d.frames[i].data(), d.frames[i - 1].data(), fb));
+        const double fade = std::max(max_step(d.frames, 60, 85), max_step(d.frames, 100, 110));
         const double rest = std::max(max_step(d.frames, 1, 50), max_step(d.frames, 86, 90));
-        std::printf("D continuity: largest step %.3f in the fades, %.3f elsewhere\n", fade, rest);
-        CHECK(fade <= kMotionSlack * rest, "a fade step of %.3f is larger than the motion elsewhere (%.3f)", fade, rest);
+        std::printf("D continuity: largest step %.3f at the seams, %.3f in the fades, %.3f elsewhere\n", seam, fade,
+                    rest);
+        CHECK(seam <= kMotionSlack * rest, "a seam step of %.3f is larger than the motion elsewhere (%.3f)", seam, rest);
     }
     }
 

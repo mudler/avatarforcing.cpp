@@ -64,6 +64,7 @@ struct Args {
     int queue_blocks = 3;
     int reanchor_every = -1, reanchor_max_defer = -1, reanchor_fade = -1;   // < 0: the GGUF value
     bool reanchor_hold = false;
+    std::string reanchor_fade_mode = "latent";
 };
 
 void usage(const char* prog) {
@@ -112,8 +113,11 @@ void usage(const char* prog) {
         "  --reanchor-max-defer N\n"
         "                        steady blocks before a reanchor also in speech; 0: none\n"
         "                        (default: from the GGUF, 162)\n"
-        "  --reanchor-fade N     cross-fade frames after a reanchor; 0: none (default: from\n"
-        "                        the GGUF, 25)\n"
+        "  --reanchor-fade M     fade after a reanchor: latent (default; the motion moves\n"
+        "                        from the old to the new face), pixel (the live app's RGB\n"
+        "                        cross-fade) or none\n"
+        "  --reanchor-fade-frames N\n"
+        "                        fade length in frames; 0: none (default: from the GGUF, 25)\n"
         "  --reanchor-hold       the reanchor block repeats the last frame, as the live app\n"
         "                        (default: compute it)\n",
         prog, prog, prog);
@@ -151,7 +155,15 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--realtime") a.realtime = true;
         else if (k == "--reanchor-every") { if (!(v = val("--reanchor-every"))) return false; a.reanchor_every = std::atoi(v); }
         else if (k == "--reanchor-max-defer") { if (!(v = val("--reanchor-max-defer"))) return false; a.reanchor_max_defer = std::atoi(v); }
-        else if (k == "--reanchor-fade") { if (!(v = val("--reanchor-fade"))) return false; a.reanchor_fade = std::atoi(v); }
+        else if (k == "--reanchor-fade-frames") { if (!(v = val("--reanchor-fade-frames"))) return false; a.reanchor_fade = std::atoi(v); }
+        else if (k == "--reanchor-fade") {
+            if (!(v = val("--reanchor-fade"))) return false;
+            a.reanchor_fade_mode = v;
+            if (a.reanchor_fade_mode != "latent" && a.reanchor_fade_mode != "pixel" && a.reanchor_fade_mode != "none") {
+                std::fprintf(stderr, "error: --reanchor-fade must be latent, pixel or none\n");
+                return false;
+            }
+        }
         else if (k == "--reanchor-hold") a.reanchor_hold = true;
         else if (k == "--queue-blocks") { if (!(v = val("--queue-blocks"))) return false; a.queue_blocks = std::atoi(v); }
         else if (k == "--audio-mode") {
@@ -525,6 +537,9 @@ int run_live(const Args& a) {
     lo.reanchor_max_defer = a.reanchor_max_defer;
     lo.reanchor_fade_frames = a.reanchor_fade;
     lo.reanchor_hold = a.reanchor_hold;
+    lo.reanchor_fade = a.reanchor_fade_mode == "pixel" ? af::ReanchorFade::Pixel
+                       : a.reanchor_fade_mode == "none" ? af::ReanchorFade::None
+                                                        : af::ReanchorFade::Latent;
     af::LiveSession live(engine, go, lo);
     auto t0 = Clock::now();
     const auto t_open = t0;

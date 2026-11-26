@@ -29,7 +29,7 @@ The model has three parts:
 | M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; faster than real time on an NVIDIA Thor (one 400 ms block every 202 ms at nfe 6, 241 ms at nfe 10) | done |
 | M8 | C API: `libavatarforcing` with `include/avatarforcing.h`, offline generation to RGB frames or mp4, streaming sessions; the CLI and the API share one pipeline | done |
 | M9 | Live mode: a session that the caller steps once per block, with idle features between phrases, a hidden primer, interrupt and a bounded frame queue; `avatarforcing-cli --live` simulates a call | done |
-| M10 | Live reanchor: a fresh primer every 112 blocks when idle (at the latest after 162) and a 25-frame cross-fade, as the live app does, so a long call does not drift | done |
+| M10 | Live reanchor: a fresh primer every 112 blocks when idle (at the latest after 162), as the live app does, so a long call does not drift; a 25-frame fade of the motion hides the seam (the live app's RGB cross-fade is an option) | done |
 | M11 | Quantized GGUF: `avatarforcing-quantize` (F16, Q8_0, K types) with a per-tensor type policy, `test_quant` against F32, end-to-end SSIM gates; F16 passes, Q8_0 does not (`docs/quantization.md`) | done |
 
 The C++ library holds all three parts in F32 or F16 (`docs/quantization.md`)

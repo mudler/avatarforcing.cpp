@@ -123,7 +123,8 @@ options:
 | `live_max_ahead_seconds` | int | 30 | live: a phrase must end at most this far after the next block |
 | `live_reanchor_every` | int | 112 (GGUF) | live: steady blocks before a reanchor when idle; 0: none |
 | `live_reanchor_max_defer` | int | 162 (GGUF) | live: steady blocks before a reanchor also in speech; 0: none |
-| `live_reanchor_fade_frames` | int | 25 (GGUF) | live: cross-fade frames after a reanchor; 0: no cross-fade |
+| `live_reanchor_fade` | string | `"latent"` | live: fade after a reanchor: `latent`, `pixel` (the live app) or `none` |
+| `live_reanchor_fade_frames` | int | 25 (GGUF) | live: fade frames after a reanchor; 0: no fade |
 | `live_reanchor_hold` | bool | false | live: the reanchor block repeats the last frame, as the live app |
 
 In a live session `audio_mode` defaults to `raw`, as in the upstream live
@@ -224,6 +225,10 @@ it with `{"live": true}`. Then:
 4. On barge-in, call `avatarforcing_session_interrupt`.
 5. Close the session with `avatarforcing_session_close`. A live session
    has no flush.
+
+Use nfe 6, the default, in live mode. At nfe 10 a reanchor step takes
+391 ms of the 400 ms of a block on an NVIDIA Thor, so nfe 10 needs a
+caller that keeps two blocks of frames ahead of playback (see "Reanchor").
 
 ```c
 avatarforcing_session* s = avatarforcing_session_open(ctx, "portrait512.png",
@@ -327,8 +332,10 @@ The model feeds on its own output: each block reads the caches that the
 blocks before it wrote. In a long call the face thus drifts away from the
 portrait. The live app counters this with a reanchor: from time to time it
 resets the caches and runs a fresh primer in place of a block. A live
-session does the same, with the policy and the cross-fade of the live app
-(`voicechat/avatar_worker.py`, `_run_loop` and `_emit_pixel_block`).
+session does the same, with the policy of the live app
+(`voicechat/avatar_worker.py`, `_run_loop`). It fades the seam in the
+motion space by default; the RGB cross-fade of the live app
+(`_emit_pixel_block`) is an option.
 
 **When.** Before each step, a reanchor is due when:
 
@@ -361,14 +368,56 @@ block continues from the primer, as after `session_open`.
   before the reanchor. The live app does this because its primer takes
   about 1.3 s, three times a block. The face then stops for 400 ms.
 
-**Cross-fade.** The face can jump at a reanchor. From the first frame that
+**Fade.** The new primer can put the head in another pose, with other eye
+and mouth states, so the face can jump at a reanchor. The
+`live_reanchor_fade_frames` frames (25, 1 s) from the first frame that
 comes from the new caches (the reanchor block, or the block after a held
-one), `live_reanchor_fade_frames` frames (25, 1 s) are blended with the
-last frame before them, in RGB:
-`frame = a * anchor + (1 - a) * frame` with `a = r / 25` for
-`r = 25, 24, ..., 1`, in float32, truncated to 8 bits, as the live app
-computes it. The first frame of the fade is thus a copy of the last frame
-before it.
+one) are faded. `live_reanchor_fade` selects how:
+
+- `"latent"` (default): a fade of the motion. The decoder draws each frame
+  from the portrait and a motion latent. Let `old` be the latent of the
+  last frame before the fade, `new[k]` the latent of fade frame `k`
+  (k = 0..24), and `w(k) = (1 + cos(pi * (k + 1) / 26)) / 2`, which goes
+  smoothly from 1 to 0. Frame `k` is decoded from
+  `new[k] + w(k) * (old - ref(k))`:
+  - in the reanchor block, `ref(k) = new[k]`: a blend from the old motion
+    to the new one. The last frames of a primer move less smoothly than
+    steady blocks (a jump of about 7 levels between their first frames in
+    an idle test), and the blend hides that.
+  - in the steady blocks after it, `ref(k)` is the last frame of the
+    primer: an offset that dies away on top of the full new motion, so
+    the lip-sync goes on. The two parts join without a step.
+
+  Each frame shows one face. Only the decoder input changes; the sampler
+  state does not. With `"live_reanchor_hold": true` there are no primer
+  frames to show, and the whole fade is the offset part.
+- `"pixel"`: the cross-fade of the live app, in RGB:
+  `frame = a * anchor + (1 - a) * frame` with `a = r / 25` for
+  `r = 25, 24, ..., 1`, in float32, truncated to 8 bits. The anchor is the
+  last frame before the fade, so the first frame of the fade is a copy of
+  it. When the pose changed, the fade shows both faces at once (two pairs
+  of eyes), and it damps the mouth motion of the new frames.
+- `"none"`: no fade.
+
+A simulated call on the CPU (nfe 6) with a reanchor forced in speech, where
+the new primer closed the eyes, compares the fades over the 25 frames from
+the reanchor (frame-to-frame mean absolute difference, 0..255; mouth: a box
+around the mouth):
+
+| fade | step into the first fade frame | largest step in the fade | mouth step in the fade |
+|---|---|---|---|
+| none | 16.35 | 16.35 | 2.97 |
+| pixel | 0.00 | 3.46 | 1.94 |
+| latent | 0.16 | 3.50 | 3.82 |
+
+Before the reanchor the largest step was 2.35 and the mouth step 3.89.
+The pixel fade halves the mouth motion and shows two pairs of eyes in the
+middle of the fade; the latent fade keeps the mouth motion and shows one
+face. The latent fade turns a pose change into a short head movement: in
+an idle test call, a reanchor that moves the head (a step of 13.9 with no
+fade) gives steps that rise smoothly to 2.9 in the middle of the fade and
+fall again, from 0.12 at the first fade frame; idle motion elsewhere is at
+most 0.9.
 
 **Cost.** A reanchor step computes a primer of 50 frames instead of a block
 of 10, so it takes longer than a steady step. On an NVIDIA Thor (CUDA,
@@ -380,10 +429,12 @@ every 20 blocks (5 reanchors):
 | 6 | 164 / 237 ms | 281 / 304 ms |
 | 10 | 249 / 300 ms | 391 / 399 ms |
 
-At nfe 6 the reanchor fits the 400 ms of a block with a margin. At nfe 10
-it uses the whole block: a caller that steps one block ahead of playback
-has no margin left on that step, so step two blocks ahead
-(`live_queue_blocks` of 3 allows it) or use nfe 6.
+Use nfe 6 in live mode: the reanchor step fits the 400 ms of a block with
+a margin. At nfe 10 the reanchor step takes 391 ms, the whole block, so a
+caller that steps one block ahead of playback has no margin left on that
+step. Use nfe 10 only when the caller keeps two blocks of frames ahead of
+playback (`live_queue_blocks` of 3 allows it). The fade adds no measurable
+time: it adds one vector to the decoder input of 25 frames.
 
 **Drift.** On the same GPU, a 120 s idle call (nfe 6) moves away from the
 portrait (mean absolute difference of the RGB frames to the portrait,
@@ -489,7 +540,8 @@ mouth moves more in the phrases than when idle.
 `AVATARFORCING_TEST_WAV` gives it real speech (16-bit or float WAV, at
 least 3.6 s). `AVATARFORCING_TEST_OVERLAP=1` runs it with the decoder
 thread. `tests/test_live_schedule.cpp` tests the feature schedule, the
-reanchor policy and the cross-fade of live mode and needs no model.
+reanchor policy, the pixel cross-fade and the motion fade weights of live
+mode and needs no model.
 
 `tests/test_live_reanchor.cpp` tests the reanchor on a model (it needs
 `AVATARFORCING_TEST_GGUF`). Short calls with a reanchor every 3 blocks
@@ -499,9 +551,12 @@ check:
   `live_reanchor_max_defer`; and on request;
 - that the frames before the first reanchor are the frames of a session
   with no reanchor;
-- that no step between two frames in a cross-fade is larger than 1.25
-  times the largest step elsewhere in the call (the face moves on under the
-  fade), and that a held block repeats the last frame;
+- that the step into the motion fade, and every step in the pixel fade,
+  is at most 1.25 times the largest step elsewhere in the call; that no
+  step in the motion fade is larger than that or 0.3 times the jump with
+  no fade (the motion fade turns a pose change into a short head
+  movement); that a held block repeats the last frame, and that a pixel
+  fade starts with a copy of it;
 - that two runs give the same frames.
 
 With `AVATARFORCING_TEST_DRIFT_SECONDS=120` it also runs a 120 s idle call

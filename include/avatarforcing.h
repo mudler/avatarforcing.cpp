@@ -263,8 +263,11 @@ AVATARFORCING_API void avatarforcing_session_close(avatarforcing_session* s);
  *                                   the GGUF)
  *   "live_reanchor_max_defer" int   steady blocks before a reanchor also in
  *                                   speech; 0: none (default 162)
- *   "live_reanchor_fade_frames" int cross-fade frames after a reanchor; 0: no
- *                                   cross-fade (default 25)
+ *   "live_reanchor_fade"      string fade after a reanchor: "latent"
+ *                                   (default), "pixel" (the live app's RGB
+ *                                   cross-fade) or "none" (see below)
+ *   "live_reanchor_fade_frames" int fade frames after a reanchor; 0: no fade
+ *                                   (default 25)
  *   "live_reanchor_hold"      bool  true: the reanchor block repeats the last
  *                                   frame, as the live app does; false
  *                                   (default): it is computed (see below)
@@ -312,13 +315,23 @@ AVATARFORCING_API void avatarforcing_session_close(avatarforcing_session* s);
  * passed, also in speech. avatarforcing_session_reanchor asks for one at the
  * next step. The reanchor block has block_frames frames, as any block: the
  * end of the new primer, or with "live_reanchor_hold" the last frame
- * repeated, as in the live app. Because the face can jump there, the frames
- * from the first frame of the new caches on (the reanchor block, or the block
- * after a held one) are cross-faded from the last frame before them over
- * live_reanchor_fade_frames frames, linearly, in RGB. The first frame of the
- * fade is that last frame. A reanchor step takes longer than a steady step
- * (a primer of 50 frames instead of 10). Frames before the first reanchor
- * do not change. */
+ * repeated, as in the live app. Because the face can jump there, the
+ * live_reanchor_fade_frames frames from the first frame of the new caches on
+ * (the reanchor block, or the block after a held one) are faded:
+ *   "latent": the decoder input (the motion latent) goes from the motion of
+ *             the last frame before the fade to the new motion, on a
+ *             raised-cosine curve: a blend in the reanchor block, then an
+ *             offset that dies away on top of the new motion. Each frame
+ *             shows one face, and the lip-sync goes on through the fade
+ *             (docs/capi.md, "Reanchor").
+ *   "pixel":  the live app's cross-fade in RGB, linear, from the last frame
+ *             before the fade, whose copy is the first frame of the fade.
+ *             When the pose changed, both faces show at once.
+ * A reanchor step takes longer than a steady step (a primer of 50 frames
+ * instead of 10): on an NVIDIA Thor about 280 ms at nfe 6 and 390 ms at
+ * nfe 10, for a block of 400 ms. Use nfe 6 in live mode, or step two blocks
+ * ahead of playback at nfe 10. Frames before the first reanchor do not
+ * change. */
 
 /* step: the frame queue is full; nothing was computed. */
 #define AVATARFORCING_LIVE_QUEUE_FULL (-2)
@@ -363,7 +376,8 @@ AVATARFORCING_API int64_t avatarforcing_session_reanchor(avatarforcing_session* 
  *    "interrupts":0,"last_step_ms":350.2,"max_step_ms":410.0,
  *    "reanchors":0,"last_reanchor_frame":-1,"blocks_since_reanchor":4,
  *    "reanchor_every":112,"reanchor_max_defer":162,
- *    "reanchor_fade_frames":25,"last_reanchor_ms":0.0,"max_reanchor_ms":0.0}
+ *    "reanchor_fade_frames":25,"reanchor_fade":"latent",
+ *    "last_reanchor_ms":0.0,"max_reanchor_ms":0.0}
  * next_frame: the first frame of the next step. speech_end: the end of the
  * last phrase (next_frame when none is pending). queued_frames: frames that
  * wait for pull, ready or in the decoder. last_reanchor_frame: the first

@@ -1,10 +1,11 @@
 // LiveSchedule test: the frame-indexed features of live mode, with no model.
 // Idle features are read cyclically by frame, phrases are placed without
 // overlap, a cut drops the phrase features from a frame on, and committed
-// frames do not change. Also the reanchor policy and cross-fade of the live
-// app, with no model.
+// frames do not change. Also the reanchor policy, the cross-fade of the live
+// app and the weights of the motion fade, with no model.
 
 #include "live.hpp"
+#include "pipeline.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -181,6 +182,20 @@ int main() {
         af::crossfade(anchor.data(), f.data(), f.size(), 12, total);
         CHECK(f[0] == 132 && f[1] == 122 && f[2] == 100 && f[3] == 107, "fade r=12: %d %d %d %d", f[0], f[1], f[2],
               f[3]);
+    }
+
+    // ---- motion fade weights: from near 1 to near 0, smooth and symmetric ----
+    {
+        const int total = 25;
+        float prev = 1.0f;
+        for (int k = 0; k < total; ++k) {
+            const float w = af::Generator::latent_fade_weight(k, total);
+            CHECK(w < prev && w > 0.f, "fade weight %d: %g after %g", k, w, prev);
+            const float m = af::Generator::latent_fade_weight(total - 1 - k, total);
+            CHECK(std::fabs(w + m - 1.0f) < 1e-6f, "fade weights %d and %d do not add up to 1", k, total - 1 - k);
+            prev = w;
+        }
+        CHECK(af::Generator::latent_fade_weight(12, 25) == 0.5f, "fade weight at the middle");
     }
 
     if (g_failures) {

@@ -226,7 +226,7 @@ static int run_call(avatarforcing_ctx* ctx, const char* portrait, const float* s
     CHECK(json_int(js, "next_frame") == 0 && json_int(js, "queue_frames") == 30, "stats after open: %s", js);
     CHECK(json_int(js, "reanchors") == 0 && json_int(js, "last_reanchor_frame") == -1 &&
               json_int(js, "reanchor_every") == 112 && json_int(js, "reanchor_max_defer") == 162 &&
-              json_int(js, "reanchor_fade_frames") == 25,
+              json_int(js, "reanchor_fade_frames") == 25 && strstr(js, "\"reanchor_fade\":\"latent\""),
           "reanchor stats after open: %s", js);
     avatarforcing_free_string(js);
 
@@ -383,6 +383,9 @@ int main(void) {
           "live_reanchor_max_defer -1 opens");
     CHECK(avatarforcing_session_open(ctx, portrait, "{\"live\": true, \"live_reanchor_hold\": 1}") == NULL,
           "live_reanchor_hold takes a number");
+    CHECK(avatarforcing_session_open(ctx, portrait, "{\"live\": true, \"live_reanchor_fade\": \"blend\"}") == NULL &&
+              strstr(avatarforcing_last_error(ctx), "latent"),
+          "live_reanchor_fade blend: %s", avatarforcing_last_error(ctx));
     uint8_t* none = NULL;
     CHECK(avatarforcing_generate_frames_pcm(ctx, portrait, speech, sr, sr, "{\"live\": true}", &none, NULL, NULL, NULL,
                                             NULL) == -1 &&
