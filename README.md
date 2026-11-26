@@ -37,6 +37,17 @@ features. The parity results against the PyTorch dumps are in
 `docs/parity.md` (flow transformer and sampler), `docs/parity-motion.md` and
 `docs/parity-wav2vec2.md`.
 
+## Model
+
+Download the converted GGUF from Hugging Face:
+[mudler/avatarforcing-cpp-gguf](https://huggingface.co/mudler/avatarforcing-cpp-gguf).
+It holds all three components in F32 (1.18 GB). The weights are licensed
+under CC BY-NC 4.0: non-commercial use only.
+
+```sh
+hf download mudler/avatarforcing-cpp-gguf avatarforcing-f32.gguf --local-dir models/
+```
+
 ## Usage
 
 ```sh
