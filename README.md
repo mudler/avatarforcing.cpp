@@ -29,9 +29,10 @@ The model has three parts:
 | M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; faster than real time on an NVIDIA Thor (one 400 ms block every 202 ms at nfe 6, 241 ms at nfe 10) | done |
 | M8 | C API: `libavatarforcing` with `include/avatarforcing.h`, offline generation to RGB frames or mp4, streaming sessions; the CLI and the API share one pipeline | done |
 | M9 | Live mode: a session that the caller steps once per block, with idle features between phrases, a hidden primer, interrupt and a bounded frame queue; `avatarforcing-cli --live` simulates a call | done |
+| M11 | Quantized GGUF: `avatarforcing-quantize` (F16, Q8_0, K types) with a per-tensor type policy, `test_quant` against F32, end-to-end SSIM gates; F16 passes, Q8_0 does not (`docs/quantization.md`) | done |
 
-The C++ library holds all three parts in F32 on the ggml CPU or CUDA backend
-(`docs/gpu.md`): the
+The C++ library holds all three parts in F32 or F16 (`docs/quantization.md`)
+on the ggml CPU or CUDA backend (`docs/gpu.md`): the
 flow transformer and its sampler loop (primer and steady blocks, rolling KV
 cache, two-branch CFG), the motion autoencoder, and the wav2vec2 audio
 features. The parity results against the PyTorch dumps are in
@@ -42,12 +43,21 @@ features. The parity results against the PyTorch dumps are in
 
 Download the converted GGUF from Hugging Face:
 [mudler/avatarforcing-cpp-gguf](https://huggingface.co/mudler/avatarforcing-cpp-gguf).
-It holds all three components in F32 (1.18 GB). The weights are licensed
-under CC BY-NC 4.0: non-commercial use only.
+Each file holds all three components. The weights are licensed under
+CC BY-NC 4.0: non-commercial use only.
+
+| File | Size | Use |
+|---|---:|---|
+| `avatarforcing-f16.gguf` | 704 MB | normal use: the same video as F32 within the gates of `docs/quantization.md` |
+| `avatarforcing-f32.gguf` | 1.18 GB | reference, parity tests |
 
 ```sh
-hf download mudler/avatarforcing-cpp-gguf avatarforcing-f32.gguf --local-dir models/
+hf download mudler/avatarforcing-cpp-gguf avatarforcing-f16.gguf --local-dir models/
 ```
+
+`avatarforcing-quantize` makes these and other types from the F32 file;
+`docs/quantization.md` gives the per-tensor types, the quality gates and the
+measured quality, speed and size of each type.
 
 ## Usage
 
@@ -98,7 +108,8 @@ cmake -B build -DGGML_NATIVE=ON
 cmake --build build -j8
 ```
 
-The tool is `build/examples/cli/avatarforcing-cli` and the library
+The tools are `build/examples/cli/avatarforcing-cli` and
+`build/examples/quantize/avatarforcing-quantize`, and the library is
 `build/libavatarforcing.so` (`-DAVATARFORCING_BUILD_SHARED=OFF` skips it).
 CMake builds ggml as static libraries inside the library and the tool;
 `-DBUILD_SHARED_LIBS=ON` links them as shared libraries instead.
@@ -133,7 +144,10 @@ ctest --test-dir build --output-on-failure
 `test_flow_parity` and `test_sampler_parity` read the flow baseline,
 `test_motion_parity` the motion baseline and `test_wav2vec2_parity` the
 wav2vec2 baseline. `test_capi` and `test_capi_live` need only the model
-GGUF (`docs/capi.md`). `test_live_schedule` needs no model.
+GGUF (`docs/capi.md`). `test_live_schedule` needs no model. `test_quant`
+compares an F16 or quantized GGUF (`AVATARFORCING_TEST_QUANT_GGUF`) with the
+F32 GGUF on the inputs of the flow and wav2vec2 baselines
+(`docs/quantization.md`).
 
 ## Reference tooling
 

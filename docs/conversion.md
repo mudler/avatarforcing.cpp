@@ -15,7 +15,8 @@ python scripts/convert_avatarforcing_to_gguf.py \
 
 `--config` is optional. Without it, the converter uses the values of the
 upstream `configs/inference.yaml` at AvatarVoice commit `566f8e1`. All tensors
-are F32 (quantization comes later, see the plan in the README).
+are F32. `avatarforcing-quantize` makes F16 and quantized files from this
+file (`docs/quantization.md`).
 
 The acceptance check is `tests/python/check_convert.py`. It rebuilds the
 expected tensors from the upstream PyTorch modules, independently of the
@@ -124,7 +125,8 @@ converter, and requires the GGUF to hold exactly that set with equal values.
 
 ## Tensors
 
-All F32. Names are at most 63 characters (ggml limit).
+All F32 (the types of the F16 and quantized files are in
+`docs/quantization.md`). Names are at most 63 characters (ggml limit).
 
 | Prefix | Source | Transform |
 |---|---|---|
