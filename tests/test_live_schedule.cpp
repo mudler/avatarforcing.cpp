@@ -1,10 +1,13 @@
 // LiveSchedule test: the frame-indexed features of live mode, with no model.
 // Idle features are read cyclically by frame, phrases are placed without
 // overlap, a cut drops the phrase features from a frame on, and committed
-// frames do not change.
+// frames do not change. Also the reanchor policy and cross-fade of the live
+// app, with no model.
 
 #include "live.hpp"
 
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -96,6 +99,89 @@ int main() {
     s.commit(20);
     s.window(5, 2, w.data(), &sp);
     CHECK(sp == 0, "released phrase still read: %d rows", sp);
+
+    // ---- reanchor policy: the block indices of the reanchors ----
+    // Idle all the time: every `every` steady blocks, so blocks 4, 9, 14.
+    {
+        af::ReanchorPolicy rp;
+        rp.every = 4;
+        rp.max_defer = 6;
+        std::vector<int> got;
+        for (int b = 0; b < 16; ++b) {
+            const bool r = rp.due(true, false);
+            if (r) got.push_back(b);
+            rp.done(r);
+        }
+        CHECK(got == std::vector<int>({4, 9, 14}), "idle reanchors: %zu", got.size());
+    }
+    // Speech in blocks 3..7: the reanchor waits, then is forced at
+    // max_defer (block 6, in speech); idle again from block 8.
+    {
+        af::ReanchorPolicy rp;
+        rp.every = 4;
+        rp.max_defer = 6;
+        std::vector<int> got;
+        for (int b = 0; b < 20; ++b) {
+            const bool idle = b < 3 || b > 7;
+            const bool r = rp.due(idle, false);
+            if (r) got.push_back(b);
+            rp.done(r);
+        }
+        CHECK(got == std::vector<int>({6, 11, 16}), "speech reanchors: %zu: %d", got.size(), got.empty() ? -1 : got[0]);
+    }
+    // The live app values: the first reanchor of an idle call is block 112
+    // (frame 1120, 44.8 s); in endless speech, block 162.
+    {
+        af::ReanchorPolicy idle_rp{112, 162}, speech_rp{112, 162};
+        int first_idle = -1, first_speech = -1;
+        for (int b = 0; b < 400 && (first_idle < 0 || first_speech < 0); ++b) {
+            if (first_idle < 0 && idle_rp.due(true, false)) first_idle = b;
+            idle_rp.done(false);
+            if (first_speech < 0 && speech_rp.due(false, false)) first_speech = b;
+            speech_rp.done(false);
+        }
+        CHECK(first_idle == 112 && first_speech == 162, "live app policy: %d %d", first_idle, first_speech);
+    }
+    // Off (0, 0): only a request reanchors.
+    {
+        af::ReanchorPolicy rp;
+        int n = 0;
+        for (int b = 0; b < 500; ++b) {
+            const bool r = rp.due(true, b == 300);
+            n += r;
+            rp.done(r);
+        }
+        CHECK(n == 1 && rp.since == 199, "policy off: %d reanchors", n);
+    }
+
+    // ---- cross-fade: the live app ramp, alpha = r / total for r = total..1 ----
+    {
+        const int total = 25;
+        std::vector<uint8_t> anchor = {0, 255, 100, 7}, frame = {255, 0, 100, 200};
+        std::vector<std::vector<uint8_t>> seq;
+        for (int r = total; r >= 1; --r) {
+            std::vector<uint8_t> f = frame;
+            af::crossfade(anchor.data(), f.data(), f.size(), r, total);
+            seq.push_back(f);
+        }
+        // The first frame is the anchor, the steps are linear (at most
+        // 255 / total + 1 apart), and the frame after the fade is the frame.
+        CHECK(seq[0] == anchor, "fade frame 0 is not the anchor");
+        int worst = 0;
+        std::vector<uint8_t> prev = anchor;
+        seq.push_back(frame);
+        for (const auto& f : seq) {
+            for (size_t i = 0; i < f.size(); ++i) worst = std::max(worst, std::abs((int)f[i] - (int)prev[i]));
+            prev = f;
+        }
+        CHECK(worst <= 255 / total + 1, "fade step %d", worst);
+        // The values of the live app expression in numpy for r = 12:
+        // (0.48 * anchor + 0.52 * frame).clip(0, 255).astype(uint8).
+        std::vector<uint8_t> f = frame;
+        af::crossfade(anchor.data(), f.data(), f.size(), 12, total);
+        CHECK(f[0] == 132 && f[1] == 122 && f[2] == 100 && f[3] == 107, "fade r=12: %d %d %d %d", f[0], f[1], f[2],
+              f[3]);
+    }
 
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

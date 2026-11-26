@@ -78,6 +78,7 @@ context with `"backend": "cuda"`.
 | `avatarforcing_session_push_phrase` | live mode: add one phrase; returns its start frame |
 | `avatarforcing_session_step` | live mode: compute the next block (speech or idle) |
 | `avatarforcing_session_interrupt` | live mode: barge-in; idle from a frame on |
+| `avatarforcing_session_reanchor` | live mode: reanchor at the next step |
 | `avatarforcing_session_stats_json` | live mode: frame clock, queue and counters |
 
 The header documents each function.
@@ -120,6 +121,10 @@ options:
 | `live` | bool | false | open a live session (see "Live mode") |
 | `live_queue_blocks` | int | 3 | live: blocks of frames that may wait for pull, 1 to 1000 |
 | `live_max_ahead_seconds` | int | 30 | live: a phrase must end at most this far after the next block |
+| `live_reanchor_every` | int | 112 (GGUF) | live: steady blocks before a reanchor when idle; 0: none |
+| `live_reanchor_max_defer` | int | 162 (GGUF) | live: steady blocks before a reanchor also in speech; 0: none |
+| `live_reanchor_fade_frames` | int | 25 (GGUF) | live: cross-fade frames after a reanchor; 0: no cross-fade |
+| `live_reanchor_hold` | bool | false | live: the reanchor block repeats the last frame, as the live app |
 
 In a live session `audio_mode` defaults to `raw`, as in the upstream live
 app, unless the request or the context options set it.
@@ -316,12 +321,94 @@ scheduled speech, the queued frames, the number of steps and of steps with
 speech, the queue-full count, the phrases, the dropped phrases, the
 interrupts, and the time of the last and the slowest step.
 
+### Reanchor
+
+The model feeds on its own output: each block reads the caches that the
+blocks before it wrote. In a long call the face thus drifts away from the
+portrait. The live app counters this with a reanchor: from time to time it
+resets the caches and runs a fresh primer in place of a block. A live
+session does the same, with the policy and the cross-fade of the live app
+(`voicechat/avatar_worker.py`, `_run_loop` and `_emit_pixel_block`).
+
+**When.** Before each step, a reanchor is due when:
+
+- `live_reanchor_every` steady blocks (112, about 45 s) have passed since
+  the primer or the last reanchor, and no phrase covers the block or comes
+  after it (the face is idle); or
+- `live_reanchor_max_defer` steady blocks (162, about 65 s) have passed,
+  also in speech; or
+- the caller asked for it with `avatarforcing_session_reanchor`.
+
+The defaults come from the GGUF (`stream.reanchor_every`,
+`stream.reanchor_max_defer`, `stream.reanchor_fade_frames`), which holds
+the live app values. The live app also waits until its audio playback has
+drained. The library does not know the playback position, so it waits
+until no phrase is pending at the block. A caller that wants the stricter
+rule sets `live_reanchor_every` to 0 and calls
+`avatarforcing_session_reanchor` when its playback is idle;
+`live_reanchor_max_defer` still bounds the drift.
+
+**What.** The reanchor step resets the caches and runs the primer on the
+features of the 50 frames that end with the block: the 40 frames before it
+and its own 10 frames. The primer takes 50 frames of noise. The next steady
+block continues from the primer, as after `session_open`.
+
+**Output.** A reanchor step gives 10 frames, as any step:
+
+- By default, the frames are the decoded last 10 frames of the new
+  primer, so the face keeps its lip-sync through the reanchor.
+- With `"live_reanchor_hold": true`, the frames repeat the last frame
+  before the reanchor. The live app does this because its primer takes
+  about 1.3 s, three times a block. The face then stops for 400 ms.
+
+**Cross-fade.** The face can jump at a reanchor. From the first frame that
+comes from the new caches (the reanchor block, or the block after a held
+one), `live_reanchor_fade_frames` frames (25, 1 s) are blended with the
+last frame before them, in RGB:
+`frame = a * anchor + (1 - a) * frame` with `a = r / 25` for
+`r = 25, 24, ..., 1`, in float32, truncated to 8 bits, as the live app
+computes it. The first frame of the fade is thus a copy of the last frame
+before it.
+
+**Cost.** A reanchor step computes a primer of 50 frames instead of a block
+of 10, so it takes longer than a steady step. On an NVIDIA Thor (CUDA,
+F32, decoder thread on), in a 60 s call paced in real time with a reanchor
+every 20 blocks (5 reanchors):
+
+| nfe | steady step, median / max | reanchor step, median / max |
+|---|---|---|
+| 6 | 164 / 237 ms | 281 / 304 ms |
+| 10 | 249 / 300 ms | 391 / 399 ms |
+
+At nfe 6 the reanchor fits the 400 ms of a block with a margin. At nfe 10
+it uses the whole block: a caller that steps one block ahead of playback
+has no margin left on that step, so step two blocks ahead
+(`live_queue_blocks` of 3 allows it) or use nfe 6.
+
+**Drift.** On the same GPU, a 120 s idle call (nfe 6) moves away from the
+portrait (mean absolute difference of the RGB frames to the portrait,
+0..255, mean of 1 s; SSIM of the luma):
+
+| time | MAD, default policy | MAD, no reanchor | SSIM, default policy | SSIM, no reanchor |
+|---|---|---|---|---|
+| 0 s | 5.5 | 5.5 | 0.855 | 0.855 |
+| 10 s | 14.1 | 14.1 | 0.715 | 0.715 |
+| 40 s | 22.8 | 22.8 | 0.648 | 0.648 |
+| 50 s | 10.9 | 25.9 | 0.746 | 0.623 |
+| 90 s | 24.0 | 36.5 | 0.636 | 0.588 |
+| 100 s | 11.8 | 42.8 | 0.740 | 0.592 |
+| 120 s | 19.6 | 39.3 | 0.676 | 0.597 |
+
+The reanchors (at 44.8 s and 90.0 s) pull the face back each time, so the
+difference stays below about 24; without them it keeps growing.
+
+Before the first reanchor the frames are the same as with no reanchor. The
+statistics give the number of reanchors, the first frame of the last one,
+the steady blocks since the last one, and the time of the last and the
+slowest reanchor step.
+
 ### Not in live mode yet
 
-- **Reanchor.** The live app re-runs the primer every 112 blocks (about
-  45 s) when it is idle, or after 162 blocks at the latest, and
-  cross-fades over 25 frames. Without it the quality drifts after about a
-  minute. The schedule keeps the features of the last 50 frames for it.
 - **Skip ahead.** When the live app falls behind, it moves its block
   clock forward. A live session computes every block in order; a caller
   that falls behind gets late frames.
@@ -345,7 +432,7 @@ interrupts, and the time of the last and the slowest step.
 - In live mode, `step` and `push_phrase` take the lock: they run one at a
   time, from any threads. `push_phrase` runs wav2vec2 on the model device,
   so a `step` waits for a `push_phrase` that runs, and the other way round.
-  `interrupt` and `stats_json` do not wait for the lock. A Go program can
+  `interrupt`, `reanchor` and `stats_json` do not wait for the lock. A Go program can
   thus run `step` on a ticker goroutine, `push_phrase` on the TTS goroutine,
   `interrupt` on the VAD goroutine and `pull_frames` on the encoder
   goroutine.
@@ -401,13 +488,31 @@ With `AVATARFORCING_TEST_PORTRAIT` (a real face) it also checks that the
 mouth moves more in the phrases than when idle.
 `AVATARFORCING_TEST_WAV` gives it real speech (16-bit or float WAV, at
 least 3.6 s). `AVATARFORCING_TEST_OVERLAP=1` runs it with the decoder
-thread. `tests/test_live_schedule.cpp` tests the feature schedule of
-live mode and needs no model.
+thread. `tests/test_live_schedule.cpp` tests the feature schedule, the
+reanchor policy and the cross-fade of live mode and needs no model.
+
+`tests/test_live_reanchor.cpp` tests the reanchor on a model (it needs
+`AVATARFORCING_TEST_GGUF`). Short calls with a reanchor every 3 blocks
+check:
+
+- the frames of the reanchors: idle; deferred in speech and forced at
+  `live_reanchor_max_defer`; and on request;
+- that the frames before the first reanchor are the frames of a session
+  with no reanchor;
+- that no step between two frames in a cross-fade is larger than 1.25
+  times the largest step elsewhere in the call (the face moves on under the
+  fade), and that a held block repeats the last frame;
+- that two runs give the same frames.
+
+With `AVATARFORCING_TEST_DRIFT_SECONDS=120` it also runs a 120 s idle call
+with the default policy and with no reanchor, and prints the difference
+to the portrait (mean absolute difference and SSIM) every 10 s. Use a GPU
+for that part.
 
 ```sh
 AVATARFORCING_TEST_GGUF=avatarforcing-f32.gguf \
 ctest --test-dir build -R test_capi --output-on-failure
 AVATARFORCING_TEST_GGUF=avatarforcing-f32.gguf \
 AVATARFORCING_TEST_PORTRAIT=portrait512.png AVATARFORCING_TEST_WAV=speech.wav \
-ctest --test-dir build -R test_capi_live --output-on-failure
+ctest --test-dir build -R 'test_capi_live|test_live_reanchor' --output-on-failure
 ```

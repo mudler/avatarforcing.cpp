@@ -358,6 +358,10 @@ bool Generator::init_sampler(std::string& err) {
             std::string err;
             while (to_decode_.pop(job)) {
                 if (failed_) continue;
+                if (job.data.empty()) {   // a held block: nothing to decode
+                    if (!to_output_.push(std::move(job), failed_)) fail("generation failed");
+                    continue;
+                }
                 Job done{{}, job.n};
                 if (!decode(job.data.data(), job.n, done.data, err)) { fail(err); continue; }
                 if (!to_output_.push(std::move(done), failed_)) fail("generation failed");
@@ -368,8 +372,11 @@ bool Generator::init_sampler(std::string& err) {
             clear_last_log();
             Job job;
             std::string err;
-            while (to_output_.pop(job))
-                if (!failed_ && !output(job.data, job.n, err)) fail(err);
+            while (to_output_.pop(job)) {
+                if (failed_) continue;
+                const bool ok = job.data.empty() ? sink_(nullptr, job.n, err) : output(job.data, job.n, err);
+                if (!ok) fail(err.empty() ? "writing frames failed" : err);
+            }
         });
     }
     return true;
@@ -432,6 +439,16 @@ bool Generator::submit(const float* latent, int n, std::string& err) {
     if (!threads_) return decode(latent, n, pixels_, err) && output(pixels_, n, err);
     if (!to_decode_.push(Job{std::vector<float>(latent, latent + (size_t)n * D_), n}, failed_))
         return failed_error(err);
+    return true;
+}
+
+bool Generator::submit_hold(int n, std::string& err) {
+    if (!threads_) {
+        if (sink_(nullptr, n, err)) return true;
+        if (err.empty()) err = "writing frames failed";
+        return false;
+    }
+    if (!to_decode_.push(Job{{}, n}, failed_)) return failed_error(err);
     return true;
 }
 
@@ -517,6 +534,23 @@ bool Generator::steady_block(const float* wa, std::string& err) {
     stats_.ms_sampler += ms;
     stats_.steady_ms.push_back(ms);
     if (!submit(latent_.data(), nb_, err)) return false;
+    t_ += nb_;
+    return true;
+}
+
+bool Generator::reanchor_block(const float* wa, bool emit, std::string& err) {
+    if (!primed_) { err = "reanchor before the primer"; return false; }
+    if (failed_) return failed_error(err);
+    if (cancel_ && cancel_->load()) { err = "cancelled"; return false; }
+    if (!noise_.next((size_t)clip_ * D_, nz_, err)) return false;
+    clear_last_log();
+    const auto t0 = Clock::now();
+    if (!sampler_->reanchor(wa, nz_.data(), x_)) { err = with_cause("reanchor failed"); return false; }
+    const double ms = ms_since(t0);
+    stats_.ms_sampler += ms;
+    stats_.reanchor_ms.push_back(ms);
+    const bool ok = emit ? submit(x_.data() + (size_t)(clip_ - nb_) * D_, nb_, err) : submit_hold(nb_, err);
+    if (!ok) return false;
     t_ += nb_;
     return true;
 }

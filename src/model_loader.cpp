@@ -35,6 +35,11 @@ struct KvReader {
         if (gguf_get_kv_type(g, id) != GGUF_TYPE_FLOAT32) { AF_LOG("KV %s: not f32", key); ok = false; return 0.f; }
         return gguf_get_val_f32(g, id);
     }
+    // An optional key: def when it is missing.
+    uint32_t u32_or(const char* key, uint32_t def) {
+        if (gguf_find_key(g, key) < 0) return def;
+        return u32(key);
+    }
     std::string str(const char* key) {
         int64_t id = find(key);
         if (id < 0) return {};
@@ -63,6 +68,9 @@ bool read_config(gguf_context* g, FlowConfig& c) {
     c.cross_cache_len        = r.u32("avatarforcing.stream.cross_cache_len");
     c.kv_shift               = r.u32("avatarforcing.stream.kv_shift");
     c.first_steady_start_pos = r.u32("avatarforcing.stream.first_steady_start_pos");
+    c.reanchor_every         = r.u32_or("avatarforcing.stream.reanchor_every", c.reanchor_every);
+    c.reanchor_max_defer     = r.u32_or("avatarforcing.stream.reanchor_max_defer", c.reanchor_max_defer);
+    c.reanchor_fade_frames   = r.u32_or("avatarforcing.stream.reanchor_fade_frames", c.reanchor_fade_frames);
     c.dim_w                  = r.u32("avatarforcing.flow.dim_w");
     c.dim_h                  = r.u32("avatarforcing.flow.dim_h");
     c.dim_a                  = r.u32("avatarforcing.flow.dim_a");

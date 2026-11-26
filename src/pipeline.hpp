@@ -123,13 +123,16 @@ private:
 };
 
 // Receives finished uint8 frames, [n, H, W, 3]. With overlap it runs in the
-// output thread. Returns false to stop the generation (set err).
+// output thread. Returns false to stop the generation (set err). rgb is
+// nullptr only for the held block of a reanchor (Generator::reanchor_block):
+// n frames that repeat the last frame.
 using FrameSink = std::function<bool(const uint8_t* rgb, int n, std::string& err)>;
 
 struct GenStats {
     double ms_encode = 0, ms_sampler = 0, ms_primer = 0, ms_decode = 0, ms_out = 0;
     double ms_first_block = 0;            // primer start to the first block of frames
     std::vector<double> steady_ms;        // sampler time per steady block
+    std::vector<double> reanchor_ms;      // sampler time per reanchor (live mode)
     std::vector<double> decode_ms;        // decoder time per full block
     std::vector<double> period_ms;        // time between finished steady blocks
     int frames = 0;                       // frames given to the sink
@@ -175,6 +178,12 @@ public:
     // One steady block of block_frames output frames. wa [context + block, E]:
     // the features of the context frames, then of the new frames.
     bool steady_block(const float* wa, std::string& err);
+    // A reanchor in place of one steady block: a primer on wa [clip, E], the
+    // features of the clip frames that end with the block, which resets the
+    // caches. emit: the block is the last block_frames tokens of the primer,
+    // decoded. Otherwise the block repeats the last frame (the sink receives
+    // rgb == nullptr), as the live app does.
+    bool reanchor_block(const float* wa, bool emit, std::string& err);
 
     // A decoder or output thread failed; err receives its message.
     bool failed(std::string* err = nullptr) const;
@@ -203,6 +212,7 @@ private:
     bool decode(const float* latent, int n, std::vector<float>& px, std::string& err);
     bool output(const std::vector<float>& px, int n, std::string& err);
     bool submit(const float* latent, int n, std::string& err);
+    bool submit_hold(int n, std::string& err);
     void fail(const std::string& msg);
     bool failed_error(std::string& err);
     void stop_threads();
