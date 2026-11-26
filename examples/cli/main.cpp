@@ -214,7 +214,7 @@ int run_info(const std::string& path) {
 
     // Tensors, grouped by the first name component.
     const int64_t n_t = gguf_get_n_tensors(g);
-    struct Group { std::string name; int64_t n = 0; size_t bytes = 0; };
+    struct Group { std::string name; int64_t n = 0; size_t bytes = 0; std::vector<std::pair<std::string, int>> types; };
     std::vector<Group> groups;
     size_t total = 0;
     for (int64_t i = 0; i < n_t; ++i) {
@@ -227,10 +227,17 @@ int run_info(const std::string& path) {
         if (it == groups.end()) { groups.push_back({pre, 0, 0}); it = groups.end() - 1; }
         it->n++;
         it->bytes += sz;
+        const std::string tn = ggml_type_name(gguf_get_tensor_type(g, i));
+        auto ty = std::find_if(it->types.begin(), it->types.end(), [&](const auto& x) { return x.first == tn; });
+        if (ty == it->types.end()) it->types.emplace_back(tn, 1); else ty->second++;
     }
     std::printf("\ntensors: %lld, %.1f MB\n", (long long)n_t, total / 1e6);
-    for (const auto& gr : groups)
-        std::printf("  %-24s %6lld tensors %10.1f MB\n", (gr.name + ".*").c_str(), (long long)gr.n, gr.bytes / 1e6);
+    for (const auto& gr : groups) {
+        std::printf("  %-24s %6lld tensors %10.1f MB  ", (gr.name + ".*").c_str(), (long long)gr.n, gr.bytes / 1e6);
+        for (size_t j = 0; j < gr.types.size(); ++j)
+            std::printf("%s%s x %d", j ? ", " : "", gr.types[j].first.c_str(), gr.types[j].second);
+        std::printf("\n");
+    }
     gguf_free(g);
     return 0;
 }
