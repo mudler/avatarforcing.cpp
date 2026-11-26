@@ -9,6 +9,7 @@
 
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_cgraph;
 struct ggml_backend_buffer;
 typedef struct ggml_backend_buffer* ggml_backend_buffer_t;
 
@@ -90,7 +91,8 @@ private:
     struct StyledConv {
         ggml_tensor *w, *wsq, *mod_w, *mod_b, *act_b;
         ggml_tensor* gbias = nullptr;   // act_gain * act_b as [1, 1, C, 1] (derived)
-        ggml_tensor* phase[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};  // transposed conv only
+        ggml_tensor* phase[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};  // transposed conv, CPU graph
+        ggml_tensor* wt = nullptr;   // GPU graph: the 3x3 weight as [OC, KW, KH, IC] (derived)
     };
     struct ToFlow { ggml_tensor *w, *mod_w, *mod_b, *b; };
     struct ToRGB { ggml_tensor *w, *act_b, *b; };
@@ -103,14 +105,17 @@ private:
     ggml_tensor* lrelu_bias(ggml_context* ctx, ggml_tensor* x, ggml_tensor* bias) const;
     ggml_tensor* blur(ggml_context* ctx, ggml_tensor* x, ggml_tensor* kernel, int pad) const;
     ggml_tensor* upsample(ggml_context* ctx, ggml_tensor* x) const;
-    ggml_tensor* styled_conv(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const StyledConv& c,
-                             bool up, ggml_tensor** s_out) const;
+    ggml_tensor* styled_conv(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* x, ggml_tensor* style,
+                             const StyledConv& c, bool up, ggml_tensor** s_out) const;
+    ggml_tensor* styled_conv_gpu(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* x, ggml_tensor* s,
+                                 const StyledConv& c, bool up) const;
 
     Backend& be_;
     ModelLoader loader_;
     MaeConfig cfg_;
     int chunk_frames_ = 1;
     bool im2col_ = false;   // conv path, see conv2d()
+    bool gpu_graph_ = false;   // decoder graph for the GPU backend, see styled_conv()
 
     // encoder
     ggml_tensor *enc_in_w_ = nullptr, *enc_in_b_ = nullptr, *enc_out_w_ = nullptr, *q_ = nullptr;

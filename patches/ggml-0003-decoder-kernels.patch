@@ -1,0 +1,1553 @@
+diff --git a/src/ggml-cuda/chan-affine.cu b/src/ggml-cuda/chan-affine.cu
+index 5e3dca12..efc840f9 100644
+--- a/src/ggml-cuda/chan-affine.cu
++++ b/src/ggml-cuda/chan-affine.cu
+@@ -73,3 +73,62 @@ void ggml_cuda_op_chan_affine_leaky(ggml_backend_cuda_context & ctx, const ggml_
+         n, hw, (int) x->ne[2], m ? (int) m->ne[2] : 1, m ? (int) m->ne[3] : 1, (int) a->ne[2], (int) a->ne[3],
+         negative_slope);
+ }
++
++// dst = o + x * m, with m [W, H, 1, B] broadcast over the channels (the
++// warp update x' = warp + x * (1 - mask) of a flow decoder). Each operation
++// is rounded as in the separate MUL and ADD kernels.
++// grid: (pixel blocks, C * B planes)
++static __global__ void mul_mask_add_f32(const float * __restrict__ x, const float * __restrict__ m,
++                                        const float * __restrict__ o, float * __restrict__ dst, const int hw,
++                                        const int C) {
++    const int pix = blockIdx.x * blockDim.x + threadIdx.x;
++    if (pix >= hw) {
++        return;
++    }
++    const int     plane = blockIdx.y;
++    const int64_t i     = (int64_t) plane * hw + pix;
++    dst[i] = __fadd_rn(o[i], __fmul_rn(x[i], m[(int64_t) (plane / C) * hw + pix]));
++}
++
++bool ggml_cuda_mul_mask_add_supported(const ggml_tensor * mul, const ggml_tensor * add) {
++    const ggml_tensor * x = mul->src[0];
++    const ggml_tensor * m = mul->src[1];
++    const ggml_tensor * o = add->src[0] == mul ? add->src[1] : add->src[0];
++    if (add->src[0] != mul && add->src[1] != mul) {
++        return false;
++    }
++    if (x->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 || o->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++        add->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(m) || !ggml_is_contiguous(o) || !ggml_is_contiguous(add)) {
++        return false;
++    }
++    if (!ggml_are_same_shape(x, mul) || !ggml_are_same_shape(o, add) || !ggml_are_same_shape(mul, add)) {
++        return false;
++    }
++    if (m->ne[0] != x->ne[0] || m->ne[1] != x->ne[1] || m->ne[2] != 1 || m->ne[3] != x->ne[3]) {
++        return false;
++    }
++    if (x->ne[0] * x->ne[1] >= INT32_MAX || x->ne[2] * x->ne[3] > 65535) {
++        return false;   // grid limits
++    }
++    // element-wise: the output may coincide exactly with x or o, but must
++    // not overlap them otherwise, nor the mask
++    if ((add->data != x->data && ranges_overlap(add, x)) || (add->data != o->data && ranges_overlap(add, o)) ||
++        ranges_overlap(add, m)) {
++        return false;
++    }
++    return true;
++}
++
++void ggml_cuda_op_mul_mask_add(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, ggml_tensor * add) {
++    const ggml_tensor * x = mul->src[0];
++    const ggml_tensor * m = mul->src[1];
++    const ggml_tensor * o = add->src[0] == mul ? add->src[1] : add->src[0];
++    const int hw = (int) (x->ne[0] * x->ne[1]);
++    const dim3 grid((hw + CUDA_CHAN_AFFINE_BLOCK_SIZE - 1) / CUDA_CHAN_AFFINE_BLOCK_SIZE, (unsigned) (x->ne[2] * x->ne[3]));
++    mul_mask_add_f32<<<grid, CUDA_CHAN_AFFINE_BLOCK_SIZE, 0, ctx.stream()>>>(
++        (const float *) x->data, (const float *) m->data, (const float *) o->data, (float *) add->data, hw,
++        (int) x->ne[2]);
++}
+diff --git a/src/ggml-cuda/chan-affine.cuh b/src/ggml-cuda/chan-affine.cuh
+index 83ff2987..690183e1 100644
+--- a/src/ggml-cuda/chan-affine.cuh
++++ b/src/ggml-cuda/chan-affine.cuh
+@@ -9,3 +9,7 @@
+ bool ggml_cuda_chan_affine_leaky_supported(const ggml_tensor * mul, const ggml_tensor * add, const ggml_tensor * leaky);
+ void ggml_cuda_op_chan_affine_leaky(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, const ggml_tensor * add,
+                                     ggml_tensor * leaky);
++
++// MUL(x, m) with m [W, H, 1, B] followed by ADD(o, .) (either operand order).
++bool ggml_cuda_mul_mask_add_supported(const ggml_tensor * mul, const ggml_tensor * add);
++void ggml_cuda_op_mul_mask_add(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, ggml_tensor * add);
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 840c274b..15d3e238 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1467,9 +1467,22 @@ struct ggml_backend_cuda_context {
+ 
+     ~ggml_backend_cuda_context();
+ 
++#ifdef GGML_CUDA_STREAM_PRIORITY
++    // greatest stream priority of the device for this context's streams
++    // (ggml_backend_cuda_set_high_priority); otherwise the default priority
++    bool high_priority = false;
++#endif
++
+     cudaStream_t stream(int device, int stream) {
+         if (streams[device][stream] == nullptr) {
+             ggml_cuda_set_device(device);
++#ifdef GGML_CUDA_STREAM_PRIORITY
++            if (high_priority) {
++                int least = 0, greatest = 0;
++                CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
++                CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, greatest));
++            } else
++#endif
+             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+         }
+         return streams[device][stream];
+diff --git a/src/ggml-cuda/conv2d-dw.cu b/src/ggml-cuda/conv2d-dw.cu
+index 8b82ad93..bb5e186c 100644
+--- a/src/ggml-cuda/conv2d-dw.cu
++++ b/src/ggml-cuda/conv2d-dw.cu
+@@ -122,20 +122,22 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
+ // halo go to shared memory (zeros outside the image), the taps to registers.
+ // The taps are summed in the order of conv2d_dw_kernel (ky outer, kx inner,
+ // one fused multiply-add each); a zero tap leaves the sum unchanged, so the
+-// result is the same as the generic kernel's.
+-template <int KW, int KH, int TW, int TH>
++// result is the same as the generic kernel's. Each thread computes RY
++// consecutive rows of one column from a register window of the tile.
++template <int KW, int KH, int TW, int TH, int RY>
+ static __global__ void __launch_bounds__(TW * TH)
+ conv2d_dw_tiled_f32(const float * __restrict__ input, const float * __restrict__ kernel, float * __restrict__ output,
+                     const int in_w, const int in_h, const int out_w, const int out_h, const int pad_x, const int pad_y,
+-                    const int channels) {
++                    const int channels, const float * __restrict__ bias, const int bias_sb, const int leaky,
++                    const float slope) {
+     constexpr int SW = TW + KW - 1;
+-    constexpr int SH = TH + KH - 1;
++    constexpr int SH = TH * RY + KH - 1;
+     __shared__ float tile[SH][SW];
+ 
+     const int plane = blockIdx.z;            // batch * channels + channel
+     const int c     = plane % channels;
+     const int ox0   = blockIdx.x * TW;
+-    const int oy0   = blockIdx.y * TH;
++    const int oy0   = blockIdx.y * TH * RY;
+     const float * in = input + (int64_t) plane * in_w * in_h;
+     const int tid = threadIdx.y * TW + threadIdx.x;
+ 
+@@ -154,22 +156,101 @@ conv2d_dw_tiled_f32(const float * __restrict__ input, const float * __restrict__
+     }
+     __syncthreads();
+ 
+-    const int ox = ox0 + threadIdx.x, oy = oy0 + threadIdx.y;
+-    if (ox >= out_w || oy >= out_h) {
++    const int ox = ox0 + threadIdx.x;
++    const int ty = threadIdx.y * RY;
++    if (ox >= out_w) {
+         return;
+     }
+-    float acc = 0.0f;
++    float win[RY + KH - 1][KW];
+ #pragma unroll
+-    for (int ky = 0; ky < KH; ++ky) {
++    for (int i = 0; i < RY + KH - 1; ++i) {
+ #pragma unroll
+         for (int kx = 0; kx < KW; ++kx) {
+-            acc = __fmaf_rn(tile[threadIdx.y + ky][threadIdx.x + kx], k[ky][kx], acc);
++            win[i][kx] = tile[ty + i][threadIdx.x + kx];
++        }
++    }
++    const float bi = bias ? bias[(plane / channels) * bias_sb + c] : 0.0f;
++#pragma unroll
++    for (int r = 0; r < RY; ++r) {
++        const int oy = oy0 + ty + r;
++        if (oy >= out_h) {
++            break;
++        }
++        float acc = 0.0f;
++#pragma unroll
++        for (int ky = 0; ky < KH; ++ky) {
++#pragma unroll
++            for (int kx = 0; kx < KW; ++kx) {
++                acc = __fmaf_rn(win[r + ky][kx], k[ky][kx], acc);
++            }
++        }
++        if (bias) {
++            // fused ADD (per-channel bias) and LEAKY_RELU, rounded as the separate kernels
++            acc = __fadd_rn(acc, bi);
++            if (leaky) {
++                acc = fmaxf(acc, 0) + fminf(acc, 0.0f) * slope;
++            }
+         }
++        output[((int64_t) plane * out_h + oy) * out_w + ox] = acc;
++    }
++}
++#endif // GGML_CUDA_CONV2D_DW_TILED
++
++#ifdef GGML_CUDA_CONV2D_DW_TILED
++static bool conv2d_dw_tiled_ok(const ggml_tensor * dw) {
++    const ggml_tensor * kernel = dw->src[0];
++    const ggml_tensor * input  = dw->src[1];
++    const int32_t *     p      = (const int32_t *) dw->op_params;
++    return kernel->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 && dw->type == GGML_TYPE_F32 &&
++           ggml_is_contiguous(input) && ggml_is_contiguous(kernel) && ggml_is_contiguous(dw) && kernel->ne[0] == 4 &&
++           kernel->ne[1] == 4 && p[0] == 1 && p[1] == 1 && p[4] == 1 && p[5] == 1 && dw->ne[2] * dw->ne[3] <= 65535;
++}
++
++static void conv2d_dw_tiled_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * dw, const float * bias,
++                                   const int bias_sb, const int leaky, const float slope, ggml_tensor * dst) {
++    const ggml_tensor * kernel = dw->src[0];
++    const ggml_tensor * input  = dw->src[1];
++    const int32_t *     p      = (const int32_t *) dw->op_params;
++    const int out_w = (int) dw->ne[0], out_h = (int) dw->ne[1], channels = (int) dw->ne[2], batches = (int) dw->ne[3];
++    constexpr int TW = 32, TH = 8;
++    if (out_h >= 64) {
++        constexpr int RY = 4;
++        const dim3 grid((out_w + TW - 1) / TW, (out_h + TH * RY - 1) / (TH * RY), channels * batches);
++        conv2d_dw_tiled_f32<4, 4, TW, TH, RY><<<grid, dim3(TW, TH), 0, ctx.stream()>>>(
++            (const float *) input->data, (const float *) kernel->data, (float *) dst->data, (int) input->ne[0],
++            (int) input->ne[1], out_w, out_h, p[2], p[3], channels, bias, bias_sb, leaky, slope);
++        return;
+     }
+-    output[((int64_t) plane * out_h + oy) * out_w + ox] = acc;
++    const dim3 grid((out_w + TW - 1) / TW, (out_h + TH - 1) / TH, channels * batches);
++    conv2d_dw_tiled_f32<4, 4, TW, TH, 1><<<grid, dim3(TW, TH), 0, ctx.stream()>>>(
++        (const float *) input->data, (const float *) kernel->data, (float *) dst->data, (int) input->ne[0],
++        (int) input->ne[1], out_w, out_h, p[2], p[3], channels, bias, bias_sb, leaky, slope);
+ }
+ #endif // GGML_CUDA_CONV2D_DW_TILED
+ 
++bool ggml_cuda_conv2d_dw_fused_supported(const ggml_tensor * dw, const ggml_tensor * bias) {
++#ifdef GGML_CUDA_CONV2D_DW_TILED
++    return conv2d_dw_tiled_ok(dw) && bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && bias->ne[0] == 1 &&
++           bias->ne[1] == 1 && bias->ne[2] == dw->ne[2] && (bias->ne[3] == 1 || bias->ne[3] == dw->ne[3]);
++#else
++    GGML_UNUSED(dw);
++    GGML_UNUSED(bias);
++    return false;
++#endif
++}
++
++void ggml_cuda_op_conv2d_dw_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * dw, const ggml_tensor * bias,
++                                  const bool has_leaky, const float slope, ggml_tensor * dst) {
++#ifdef GGML_CUDA_CONV2D_DW_TILED
++    conv2d_dw_tiled_launch(ctx, dw, (const float *) bias->data, bias->ne[3] == 1 ? 0 : (int) bias->ne[2],
++                           has_leaky ? 1 : 0, slope, dst);
++#else
++    GGML_UNUSED(ctx); GGML_UNUSED(dw); GGML_UNUSED(bias); GGML_UNUSED(has_leaky); GGML_UNUSED(slope);
++    GGML_UNUSED(dst);
++    GGML_ABORT("conv2d_dw fusion needs GGML_CUDA_CONV2D_DW_TILED");
++#endif
++}
++
+ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * kernel = dst->src[0];
+     const ggml_tensor * input  = dst->src[1];
+@@ -202,12 +283,8 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
+ 
+ #ifdef GGML_CUDA_CONV2D_DW_TILED
+-    if (ggml_is_contiguous(input) && ggml_is_contiguous(kernel) && kernel_w == 4 && kernel_h == 4 &&
+-        stride_x == 1 && stride_y == 1 && dilation_x == 1 && dilation_y == 1 && channels * batches <= 65535) {
+-        constexpr int TW = 32, TH = 8;
+-        const dim3 grid((out_w + TW - 1) / TW, (out_h + TH - 1) / TH, channels * batches);
+-        conv2d_dw_tiled_f32<4, 4, TW, TH><<<grid, dim3(TW, TH), 0, st>>>(x_d, w_d, y_d, in_w, in_h, out_w, out_h,
+-                                                                        padding_x, padding_y, channels);
++    if (conv2d_dw_tiled_ok(dst)) {
++        conv2d_dw_tiled_launch(ctx, dst, nullptr, 0, 0, 0.0f, dst);
+         return;
+     }
+ #endif
+diff --git a/src/ggml-cuda/conv2d-dw.cuh b/src/ggml-cuda/conv2d-dw.cuh
+index b5d5a69d..568fab18 100644
+--- a/src/ggml-cuda/conv2d-dw.cuh
++++ b/src/ggml-cuda/conv2d-dw.cuh
+@@ -3,3 +3,9 @@
+ 
+ #define CUDA_CONV2D_DW_BLOCK_SIZE 256
+ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// CONV_2D_DW (4 x 4, stride 1, the tiled kernel) followed by ADD of a
++// per-channel bias [1, 1, C, 1 or B] and optionally LEAKY_RELU, in one pass.
++bool ggml_cuda_conv2d_dw_fused_supported(const ggml_tensor * dw, const ggml_tensor * bias);
++void ggml_cuda_op_conv2d_dw_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * dw, const ggml_tensor * bias,
++                                  bool has_leaky, float slope, ggml_tensor * dst);
+diff --git a/src/ggml-cuda/conv2d-tile.cu b/src/ggml-cuda/conv2d-tile.cu
+new file mode 100644
+index 00000000..57b04b44
+--- /dev/null
++++ b/src/ggml-cuda/conv2d-tile.cu
+@@ -0,0 +1,724 @@
++#include "conv2d-tile.cuh"
++
++// See conv2d-tile.cuh. Layout: input [W, H, IC, B], output [W, H, OC, B]
++// (WHCN, contiguous); the kernel is read through its strides.
++
++struct conv_tile_args {
++    const float * x;
++    const float * w;
++    float *       y;
++    int IW, IH, IC, OC;
++    int OWp, OHp;                     // output grid of this launch: [ox_base, OWp) x [oy_base, OHp)
++    int ox_base, oy_base;
++    int pad_x, pad_y;                 // input offset: iy = oy - pad_y + ky
++    int64_t w_sn, w_sc, w_sy, w_sx;   // kernel strides in floats: out channel, in channel, row, column
++    int tap_y0, tap_ys, tap_x0, tap_xs; // kernel row of tap ky: tap_y0 + ky * tap_ys (same for x)
++    int YW, YH;                       // output plane
++    int y_sy, y_oy, y_sx, y_ox;       // output position (oy * y_sy + y_oy, ox * y_sx + y_ox)
++    int vec_store;                    // rows can be written with float4 stores
++    int w_vec;                        // kernel rows of 4 output channels can be read with 16-byte copies
++    conv_tile_vec in_scale, out_scale, bias;
++    int   leaky;
++    float slope;
++};
++
++static __device__ __forceinline__ void conv_tile_cp_f32(float * dst, const float * src, const bool ok) {
++#ifdef CP_ASYNC_AVAILABLE
++    const unsigned int d = (unsigned int) __cvta_generic_to_shared(dst);
++    const int n = ok ? 4 : 0;   // n = 0: zero fill, nothing is read
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" : : "r"(d), "l"(src), "r"(n));
++#else
++    *dst = ok ? *src : 0.0f;
++#endif
++}
++
++static __device__ __forceinline__ void conv_tile_cp_f32x4(float * dst, const float * src, const bool ok) {
++#ifdef CP_ASYNC_AVAILABLE
++    const unsigned int d = (unsigned int) __cvta_generic_to_shared(dst);
++    const int n = ok ? 16 : 0;
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" : : "r"(d), "l"(src), "r"(n));
++#else
++    const float4 v = ok ? *reinterpret_cast<const float4 *>(src) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    *reinterpret_cast<float4 *>(dst) = v;
++#endif
++}
++
++static __device__ __forceinline__ void conv_tile_cp_commit() {
++#ifdef CP_ASYNC_AVAILABLE
++    asm volatile("cp.async.commit_group;");
++#endif
++}
++
++template <int N>
++static __device__ __forceinline__ void conv_tile_cp_wait() {
++#ifdef CP_ASYNC_AVAILABLE
++    asm volatile("cp.async.wait_group %0;" : : "n"(N));
++#endif
++}
++
++static __device__ __forceinline__ float conv_tile_epilogue(float t, const float sc, const float bi, const bool has_sc,
++                                                           const bool has_bi, const int leaky, const float slope) {
++    if (has_sc) {
++        t = __fmul_rn(t, sc);
++    }
++    if (has_bi) {
++        t = __fadd_rn(t, bi);
++    }
++    if (leaky) {
++        // the expression of op_leaky_relu in unary.cu
++        t = fmaxf(t, 0) + fminf(t, 0.0f) * slope;
++    }
++    return t;
++}
++
++// One block: a TH x TW tile of output pixels of one image times BN output
++// channels. Each thread: 8 consecutive pixels of one row times 8 channels
++// (tn*4 .. tn*4+3 and BN/2 + tn*4 .. +3, for conflict-free float4 reads).
++// Input channels go in chunks of CI through double-buffered shared memory
++// filled with cp.async (zero fill for the padding).
++template <int KH, int KW, int TH, int TW, int BN, bool SCALE>
++static __global__ void __launch_bounds__((TW / 8) * TH * (BN / 8))
++conv2d_tile_f32(const conv_tile_args a) {
++    constexpr int PX = 8;              // pixels per thread
++    constexpr int CI = 4;              // input channels per chunk
++    constexpr int NG = BN / 8;         // channel groups
++    constexpr int CG = TW / PX;        // column groups
++    constexpr int NT = CG * TH * NG;   // threads
++    constexpr int SH = TH + KH - 1;
++    constexpr int SW = TW + KW - 1;
++    constexpr int KK = KH * KW;
++    constexpr int XS = CI * SH * SW;
++    constexpr int WS = CI * KK * BN;
++    constexpr int AW = PX + KW - 1;
++
++    __shared__ __align__(16) float xs[2][CI][SH][SW];
++    __shared__ __align__(16) float ws[2][CI][KK][BN];
++
++    const int tid = threadIdx.x;
++    const int tn  = tid % NG;
++    const int tp  = tid / NG;
++    const int tr  = tp / CG;
++    const int tc  = (tp % CG) * PX;
++
++    const int tiles_x = (a.OWp - a.ox_base + TW - 1) / TW;
++    const int ox0 = a.ox_base + (blockIdx.x % tiles_x) * TW;
++    const int oy0 = a.oy_base + (blockIdx.x / tiles_x) * TH;
++    const int n0  = blockIdx.y * BN;
++    const int b   = blockIdx.z;
++
++    const float * xb = a.x + (int64_t) b * a.IC * a.IH * a.IW;
++    const int iy0 = oy0 - a.pad_y;
++    const int ix0 = ox0 - a.pad_x;
++    const int nchunks = (a.IC + CI - 1) / CI;
++
++    auto load = [&](const int chunk, const int buf) {
++        const int ic0 = chunk * CI;
++        for (int i = tid; i < XS; i += NT) {
++            const int c   = i / (SH * SW);
++            const int rem = i - c * (SH * SW);
++            const int r   = rem / SW;
++            const int col = rem - r * SW;
++            const int ic = ic0 + c, iy = iy0 + r, ix = ix0 + col;
++            const bool ok = ic < a.IC && iy >= 0 && iy < a.IH && ix >= 0 && ix < a.IW;
++            conv_tile_cp_f32(&xs[buf][c][r][col], ok ? xb + ((int64_t) ic * a.IH + iy) * a.IW + ix : a.x, ok);
++        }
++        if (a.w_vec) {
++            for (int i = tid; i < WS / 4; i += NT) {
++                const int n   = (i % (BN / 4)) * 4;
++                const int rem = i / (BN / 4);
++                const int c   = rem / KK;
++                const int kk  = rem - c * KK;
++                const int ky  = kk / KW;
++                const int kx  = kk - ky * KW;
++                const int ic = ic0 + c, on = n0 + n;
++                const bool ok = ic < a.IC && on < a.OC;
++                const float * src = a.w + on + ic * a.w_sc + (int64_t) (a.tap_y0 + ky * a.tap_ys) * a.w_sy +
++                                    (int64_t) (a.tap_x0 + kx * a.tap_xs) * a.w_sx;
++                conv_tile_cp_f32x4(&ws[buf][c][kk][n], ok ? src : a.w, ok);
++            }
++        } else {
++            for (int i = tid; i < WS; i += NT) {
++                const int n   = i % BN;
++                const int rem = i / BN;
++                const int c   = rem / KK;
++                const int kk  = rem - c * KK;
++                const int ky  = kk / KW;
++                const int kx  = kk - ky * KW;
++                const int ic = ic0 + c, on = n0 + n;
++                const bool ok = ic < a.IC && on < a.OC;
++                const float * src = a.w + on * a.w_sn + ic * a.w_sc + (int64_t) (a.tap_y0 + ky * a.tap_ys) * a.w_sy +
++                                    (int64_t) (a.tap_x0 + kx * a.tap_xs) * a.w_sx;
++                conv_tile_cp_f32(&ws[buf][c][kk][n], ok ? src : a.w, ok);
++            }
++        }
++        conv_tile_cp_commit();
++    };
++
++    float acc[PX][8];
++#pragma unroll
++    for (int j = 0; j < PX; ++j) {
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            acc[j][e] = 0.0f;
++        }
++    }
++
++    load(0, 0);
++    for (int ch = 0; ch < nchunks; ++ch) {
++        const int buf = ch & 1;
++        if (ch + 1 < nchunks) {
++            load(ch + 1, buf ^ 1);
++            conv_tile_cp_wait<1>();
++        } else {
++            conv_tile_cp_wait<0>();
++        }
++        if (SCALE) {
++            // modulation: each thread scales the input values it copied
++            // (its copies are complete after the wait), x * s rounded as MUL
++            for (int i = tid; i < XS; i += NT) {
++                const int ic = ch * CI + i / (SH * SW);
++                float * p = &xs[buf][0][0][0] + i;
++                *p = __fmul_rn(*p, ic < a.IC ? a.in_scale.d[b * a.in_scale.sb + ic] : 0.0f);
++            }
++        }
++        __syncthreads();
++#pragma unroll
++        for (int c = 0; c < CI; ++c) {
++#pragma unroll
++            for (int ky = 0; ky < KH; ++ky) {
++                float av[AW];
++#pragma unroll
++                for (int j = 0; j < AW; ++j) {
++                    av[j] = xs[buf][c][tr + ky][tc + j];
++                }
++#pragma unroll
++                for (int kx = 0; kx < KW; ++kx) {
++                    const float4 b0 = *reinterpret_cast<const float4 *>(&ws[buf][c][ky * KW + kx][tn * 4]);
++                    const float4 b1 = *reinterpret_cast<const float4 *>(&ws[buf][c][ky * KW + kx][BN / 2 + tn * 4]);
++                    const float bv[8] = { b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w };
++#pragma unroll
++                    for (int j = 0; j < PX; ++j) {
++#pragma unroll
++                        for (int e = 0; e < 8; ++e) {
++                            acc[j][e] = __fmaf_rn(av[j + kx], bv[e], acc[j][e]);
++                        }
++                    }
++                }
++            }
++        }
++        __syncthreads();
++    }
++
++    const int oy = oy0 + tr;
++    const int ox = ox0 + tc;
++    if (oy >= a.OHp || ox >= a.OWp) {
++        return;
++    }
++    const bool has_sc = a.out_scale.d != nullptr;
++    const bool has_bi = a.bias.d != nullptr;
++    const bool full   = a.vec_store && ox + PX <= a.OWp;
++#pragma unroll
++    for (int e = 0; e < 8; ++e) {
++        const int n = n0 + (e < 4 ? tn * 4 + e : BN / 2 + tn * 4 + e - 4);
++        if (n >= a.OC) {
++            continue;
++        }
++        const float sc = has_sc ? a.out_scale.d[b * a.out_scale.sb + n] : 1.0f;
++        const float bi = has_bi ? a.bias.d[b * a.bias.sb + n] : 0.0f;
++        float * yrow = a.y + (((int64_t) b * a.OC + n) * a.YH + (int64_t) oy * a.y_sy + a.y_oy) * a.YW + a.y_ox;
++        float v[PX];
++#pragma unroll
++        for (int j = 0; j < PX; ++j) {
++            v[j] = conv_tile_epilogue(acc[j][e], sc, bi, has_sc, has_bi, a.leaky, a.slope);
++        }
++        if (full) {
++            float4 * p = reinterpret_cast<float4 *>(yrow + ox);
++#pragma unroll
++            for (int j = 0; j < PX / 4; ++j) {
++                p[j] = make_float4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
++            }
++        } else {
++#pragma unroll
++            for (int j = 0; j < PX; ++j) {
++                if (ox + j < a.OWp) {
++                    yrow[(int64_t) (ox + j) * a.y_sx] = v[j];
++                }
++            }
++        }
++    }
++}
++
++template <int KH, int KW, int TH, int TW, int BN>
++static void conv2d_tile_launch_t(const conv_tile_args & a, const int B, cudaStream_t st) {
++    const int tiles = ((a.OWp - a.ox_base + TW - 1) / TW) * ((a.OHp - a.oy_base + TH - 1) / TH);
++    const dim3 grid((unsigned) tiles, (unsigned) ((a.OC + BN - 1) / BN), (unsigned) B);
++    constexpr int NT = (TW / 8) * TH * (BN / 8);
++    if (a.in_scale.d) {
++        conv2d_tile_f32<KH, KW, TH, TW, BN, true><<<grid, NT, 0, st>>>(a);
++    } else {
++        conv2d_tile_f32<KH, KW, TH, TW, BN, false><<<grid, NT, 0, st>>>(a);
++    }
++}
++
++// Tile shape by output width and channel count.
++template <int KH, int KW>
++static void conv2d_tile_launch_k(const conv_tile_args & a, const int B, cudaStream_t st) {
++    const int w = a.OWp - a.ox_base;
++    if (w >= 32) {
++        if (a.OC <= 32) {
++            conv2d_tile_launch_t<KH, KW, 16, 32, 32>(a, B, st);
++        } else {
++            conv2d_tile_launch_t<KH, KW, 8, 32, 64>(a, B, st);
++        }
++    } else if (w >= 16) {
++        conv2d_tile_launch_t<KH, KW, 16, 16, 64>(a, B, st);
++    } else {
++        conv2d_tile_launch_t<KH, KW, 8, 8, 64>(a, B, st);
++    }
++}
++
++static void conv2d_tile_launch(const int KH, const int KW, const conv_tile_args & a, const int B, cudaStream_t st) {
++    if (KH == 3 && KW == 3) {
++        conv2d_tile_launch_k<3, 3>(a, B, st);
++    } else if (KH == 2 && KW == 2) {
++        conv2d_tile_launch_k<2, 2>(a, B, st);
++    } else if (KH == 2 && KW == 1) {
++        conv2d_tile_launch_k<2, 1>(a, B, st);
++    } else if (KH == 1 && KW == 2) {
++        conv2d_tile_launch_k<1, 2>(a, B, st);
++    } else if (KH == 1 && KW == 1) {
++        conv2d_tile_launch_k<1, 1>(a, B, st);
++    } else {
++        GGML_ABORT("conv2d_tile: unsupported kernel %d x %d", KH, KW);
++    }
++}
++
++// Stride-2 transposed 3 x 3 convolution, one output row parity ey per
++// launch, both column parities in the same block: grid position (i, j) of
++// the input gives the output pixels (2i + ey, 2j) and (2i + ey, 2j + 1).
++// Column 2j takes the taps kx = 2, 0 over input columns j - 1, j, column
++// 2j + 1 the tap kx = 1 over column j; rows likewise with the taps of the
++// phase (a.tap_y0, a.tap_ys, a.pad_y). Covers i < a.OHp, j < a.OWp; the last
++// even row and column (2H, 2W) are done by conv2d_tile_f32 strips. Each
++// thread: 4 grid columns (8 output columns) times 8 channels. The sums are
++// the same chains as the phase convolutions.
++template <int KH, int TH, int TW, int BN, bool SCALE>
++static __global__ void __launch_bounds__((TW / 4) * TH * (BN / 8))
++convt_s2_pair_f32(const conv_tile_args a) {
++    constexpr int PX = 4;              // grid columns per thread
++    constexpr int CI = 16 / KH;        // input channels per chunk
++    constexpr int NG = BN / 8;
++    constexpr int CG = TW / PX;
++    constexpr int NT = CG * TH * NG;
++    constexpr int SH = TH + KH - 1;
++    constexpr int SW = TW + 1;
++    constexpr int KK = KH * 3;         // per row tap: kx = 2, 0 (even column), 1 (odd column)
++    constexpr int XS = CI * SH * SW;
++    constexpr int WS = CI * KK * BN;
++
++    __shared__ __align__(16) float xs[2][CI][SH][SW];
++    __shared__ __align__(16) float ws[2][CI][KK][BN];
++
++    const int tid = threadIdx.x;
++    const int tn  = tid % NG;
++    const int tp  = tid / NG;
++    const int tr  = tp / CG;
++    const int tc  = (tp % CG) * PX;
++
++    const int tiles_x = (a.OWp + TW - 1) / TW;
++    const int ox0 = (blockIdx.x % tiles_x) * TW;
++    const int oy0 = (blockIdx.x / tiles_x) * TH;
++    const int n0  = blockIdx.y * BN;
++    const int b   = blockIdx.z;
++
++    const float * xb = a.x + (int64_t) b * a.IC * a.IH * a.IW;
++    const int iy0 = oy0 - a.pad_y;
++    const int ix0 = ox0 - 1;
++    const int nchunks = (a.IC + CI - 1) / CI;
++
++    auto load = [&](const int chunk, const int buf) {
++        const int ic0 = chunk * CI;
++        for (int i = tid; i < XS; i += NT) {
++            const int c   = i / (SH * SW);
++            const int rem = i - c * (SH * SW);
++            const int r   = rem / SW;
++            const int col = rem - r * SW;
++            const int ic = ic0 + c, iy = iy0 + r, ix = ix0 + col;
++            const bool ok = ic < a.IC && iy >= 0 && iy < a.IH && ix >= 0 && ix < a.IW;
++            conv_tile_cp_f32(&xs[buf][c][r][col], ok ? xb + ((int64_t) ic * a.IH + iy) * a.IW + ix : a.x, ok);
++        }
++        const int vs = a.w_vec ? 2 : 0;   // log2 of the copy width in floats
++        for (int i = tid; i < (WS >> vs); i += NT) {
++            const int n   = (i % (BN >> vs)) << vs;
++            const int rem = i / (BN >> vs);
++            const int c   = rem / KK;
++            const int kk  = rem - c * KK;
++            const int ky  = kk / 3;
++            const int t   = kk - ky * 3;
++            const int kx  = t == 0 ? 2 : (t == 1 ? 0 : 1);
++            const int ic = ic0 + c, on = n0 + n;
++            const bool ok = ic < a.IC && on < a.OC;
++            const float * src = a.w + on * a.w_sn + ic * a.w_sc + (int64_t) (a.tap_y0 + ky * a.tap_ys) * a.w_sy +
++                                (int64_t) kx * a.w_sx;
++            if (a.w_vec) {
++                conv_tile_cp_f32x4(&ws[buf][c][kk][n], ok ? src : a.w, ok);
++            } else {
++                conv_tile_cp_f32(&ws[buf][c][kk][n], ok ? src : a.w, ok);
++            }
++        }
++        conv_tile_cp_commit();
++    };
++
++    float acc[2 * PX][8];
++#pragma unroll
++    for (int j = 0; j < 2 * PX; ++j) {
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            acc[j][e] = 0.0f;
++        }
++    }
++
++    load(0, 0);
++    for (int ch = 0; ch < nchunks; ++ch) {
++        const int buf = ch & 1;
++        if (ch + 1 < nchunks) {
++            load(ch + 1, buf ^ 1);
++            conv_tile_cp_wait<1>();
++        } else {
++            conv_tile_cp_wait<0>();
++        }
++        if (SCALE) {
++            // modulation: each thread scales the input values it copied
++            // (its copies are complete after the wait), x * s rounded as MUL
++            for (int i = tid; i < XS; i += NT) {
++                const int ic = ch * CI + i / (SH * SW);
++                float * p = &xs[buf][0][0][0] + i;
++                *p = __fmul_rn(*p, ic < a.IC ? a.in_scale.d[b * a.in_scale.sb + ic] : 0.0f);
++            }
++        }
++        __syncthreads();
++#pragma unroll
++        for (int c = 0; c < CI; ++c) {
++#pragma unroll
++            for (int ky = 0; ky < KH; ++ky) {
++                float av[PX + 1];
++#pragma unroll
++                for (int j = 0; j < PX + 1; ++j) {
++                    av[j] = xs[buf][c][tr + ky][tc + j];
++                }
++                float bv[3][8];
++#pragma unroll
++                for (int t = 0; t < 3; ++t) {
++                    const float4 b0 = *reinterpret_cast<const float4 *>(&ws[buf][c][ky * 3 + t][tn * 4]);
++                    const float4 b1 = *reinterpret_cast<const float4 *>(&ws[buf][c][ky * 3 + t][BN / 2 + tn * 4]);
++                    bv[t][0] = b0.x; bv[t][1] = b0.y; bv[t][2] = b0.z; bv[t][3] = b0.w;
++                    bv[t][4] = b1.x; bv[t][5] = b1.y; bv[t][6] = b1.z; bv[t][7] = b1.w;
++                }
++#pragma unroll
++                for (int j = 0; j < PX; ++j) {
++#pragma unroll
++                    for (int e = 0; e < 8; ++e) {
++                        // even column 2j: kx = 2 over column j - 1, then kx = 0 over column j
++                        acc[2 * j][e] = __fmaf_rn(av[j], bv[0][e], acc[2 * j][e]);
++                        acc[2 * j][e] = __fmaf_rn(av[j + 1], bv[1][e], acc[2 * j][e]);
++                        // odd column 2j + 1: kx = 1 over column j
++                        acc[2 * j + 1][e] = __fmaf_rn(av[j + 1], bv[2][e], acc[2 * j + 1][e]);
++                    }
++                }
++            }
++        }
++        __syncthreads();
++    }
++
++    const int oy = oy0 + tr;
++    const int ox = ox0 + tc;
++    if (oy >= a.OHp || ox >= a.OWp) {
++        return;
++    }
++    const bool has_sc = a.out_scale.d != nullptr;
++#pragma unroll
++    for (int e = 0; e < 8; ++e) {
++        const int n = n0 + (e < 4 ? tn * 4 + e : BN / 2 + tn * 4 + e - 4);
++        if (n >= a.OC) {
++            continue;
++        }
++        const float sc = has_sc ? a.out_scale.d[b * a.out_scale.sb + n] : 1.0f;
++        float * yrow = a.y + (((int64_t) b * a.OC + n) * a.YH + (int64_t) oy * a.y_sy + a.y_oy) * a.YW;
++#pragma unroll
++        for (int j = 0; j < 2 * PX; ++j) {
++            if (ox + j / 2 < a.OWp) {
++                yrow[2 * ox + j] = conv_tile_epilogue(acc[j][e], sc, 0.0f, has_sc, false, 0, 0.0f);
++            }
++        }
++    }
++}
++
++template <int KH, int TH, int TW, int BN>
++static void convt_s2_pair_launch_t(const conv_tile_args & a, const int B, cudaStream_t st) {
++    const int tiles = ((a.OWp + TW - 1) / TW) * ((a.OHp + TH - 1) / TH);
++    const dim3 grid((unsigned) tiles, (unsigned) ((a.OC + BN - 1) / BN), (unsigned) B);
++    constexpr int NT = (TW / 4) * TH * (BN / 8);
++    if (a.in_scale.d) {
++        convt_s2_pair_f32<KH, TH, TW, BN, true><<<grid, NT, 0, st>>>(a);
++    } else {
++        convt_s2_pair_f32<KH, TH, TW, BN, false><<<grid, NT, 0, st>>>(a);
++    }
++}
++
++template <int KH>
++static void convt_s2_pair_launch(const conv_tile_args & a, const int B, cudaStream_t st) {
++    if (a.OWp >= 32) {
++        if (a.OC <= 32) {
++            convt_s2_pair_launch_t<KH, 8, 32, 32>(a, B, st);
++        } else {
++            convt_s2_pair_launch_t<KH, 4, 32, 64>(a, B, st);
++        }
++    } else if (a.OWp >= 16) {
++        convt_s2_pair_launch_t<KH, 8, 16, 64>(a, B, st);
++    } else if (a.OWp >= 8) {
++        convt_s2_pair_launch_t<KH, 8, 8, 64>(a, B, st);
++    } else {
++        convt_s2_pair_launch_t<KH, 4, 4, 64>(a, B, st);
++    }
++}
++
++// 1 x 1 convolution with few output channels (<= 4): one thread per pixel,
++// all output channels at once, so the input is read once. Same arithmetic
++// as conv2d_kernel in conv2d.cu (one fused multiply-add chain over the
++// input channels).
++template <int OCT, bool SCALE>
++static __global__ void conv2d_1x1_small_f32(const float * __restrict__ x, const float * __restrict__ w,
++                                            float * __restrict__ y, const int64_t HW, const int IC, const int OC,
++                                            const int B, const conv_tile_vec in_scale) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= HW * B) {
++        return;
++    }
++    const int     b   = (int) (i / HW);
++    const int64_t pix = i - (int64_t) b * HW;
++    const float * xp  = x + (int64_t) b * IC * HW + pix;
++    float acc[OCT];
++#pragma unroll
++    for (int o = 0; o < OCT; ++o) {
++        acc[o] = 0.0f;
++    }
++    for (int ic = 0; ic < IC; ++ic) {
++        float v = xp[(int64_t) ic * HW];
++        if (SCALE) {
++            v = __fmul_rn(v, in_scale.d[b * in_scale.sb + ic]);
++        }
++#pragma unroll
++        for (int o = 0; o < OCT; ++o) {
++            if (o < OC) {
++                acc[o] = __fmaf_rn(v, __ldg(w + (int64_t) o * IC + ic), acc[o]);
++            }
++        }
++    }
++    float * yp = y + (int64_t) b * OC * HW + pix;
++#pragma unroll
++    for (int o = 0; o < OCT; ++o) {
++        if (o < OC) {
++            yp[(int64_t) o * HW] = acc[o];
++        }
++    }
++}
++
++bool ggml_cuda_conv_tile_chan_vec_ok(const ggml_tensor * t, const int64_t C, const int64_t B) {
++    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == 1 && t->ne[1] == 1 && t->ne[2] == C &&
++           (t->ne[3] == 1 || t->ne[3] == B);
++}
++
++// 16-byte weight copies: output channel stride 1, rows of 4 channels aligned
++static int conv_tile_w_vec(const conv_tile_args & a) {
++    return a.w_sn == 1 && a.OC % 4 == 0 && a.w_sc % 4 == 0 && a.w_sy % 4 == 0 && a.w_sx % 4 == 0 &&
++           (uintptr_t) a.w % 16 == 0;
++}
++
++static conv_tile_vec conv_tile_vec_of(const ggml_tensor * t) {
++    conv_tile_vec v;
++    if (t) {
++        v.d  = (const float *) t->data;
++        v.sb = t->ne[3] == 1 ? 0 : (int) t->ne[2];
++    }
++    return v;
++}
++
++static bool conv_tile_small_1x1(const ggml_tensor * conv) {
++    const ggml_tensor * k = conv->src[0];
++    return k->ne[0] == 1 && k->ne[1] == 1 && k->ne[3] <= 4 && ggml_is_contiguous(k);
++}
++
++bool ggml_cuda_conv2d_tile_supported(const ggml_tensor * conv) {
++    if (conv->op != GGML_OP_CONV_2D) {
++        return false;
++    }
++    const ggml_tensor * k = conv->src[0];
++    const ggml_tensor * x = conv->src[1];
++    const int32_t *     p = (const int32_t *) conv->op_params;
++    if (k->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || conv->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(x) || !ggml_is_contiguous(conv) || p[6] != 0) {
++        return false;
++    }
++    if (p[0] != 1 || p[1] != 1 || p[4] != 1 || p[5] != 1) {
++        return false;   // stride and dilation 1
++    }
++    const int64_t KW = k->ne[0], KH = k->ne[1];
++    if (KW == 1 && KH == 1 && p[2] == 0 && p[3] == 0 && conv_tile_small_1x1(conv)) {
++        return true;
++    }
++    const bool shape = (KW == 3 && KH == 3) || (KW <= 2 && KH <= 2);
++    return shape && x->ne[0] * x->ne[1] * x->ne[2] * x->ne[3] < INT32_MAX &&
++           conv->ne[0] * conv->ne[1] * conv->ne[2] * conv->ne[3] < INT32_MAX;
++}
++
++void ggml_cuda_conv2d_tile(ggml_backend_cuda_context & ctx, const ggml_tensor * conv, const ggml_tensor * x,
++                           const ggml_tensor * in_scale, const ggml_tensor * out_scale, const ggml_tensor * bias,
++                           const bool has_leaky, const float slope, ggml_tensor * dst) {
++    const ggml_tensor * k = conv->src[0];
++    const int32_t *     p = (const int32_t *) conv->op_params;
++    cudaStream_t        st = ctx.stream();
++    const int B = (int) x->ne[3];
++
++    if (k->ne[0] == 1 && k->ne[1] == 1 && p[2] == 0 && p[3] == 0 && conv_tile_small_1x1(conv)) {
++        GGML_ASSERT(!out_scale && !bias && !has_leaky);
++        const int64_t HW  = x->ne[0] * x->ne[1];
++        const int     IC  = (int) x->ne[2];
++        const int     OC  = (int) k->ne[3];
++        const int64_t n   = HW * B;
++        const int     nb  = 256;
++        const conv_tile_vec s = conv_tile_vec_of(in_scale);
++        const dim3 grid((unsigned) ((n + nb - 1) / nb));
++        if (in_scale) {
++            conv2d_1x1_small_f32<4, true><<<grid, nb, 0, st>>>((const float *) x->data, (const float *) k->data,
++                                                                (float *) dst->data, HW, IC, OC, B, s);
++        } else {
++            conv2d_1x1_small_f32<4, false><<<grid, nb, 0, st>>>((const float *) x->data, (const float *) k->data,
++                                                                 (float *) dst->data, HW, IC, OC, B, s);
++        }
++        return;
++    }
++
++    conv_tile_args a = {};
++    a.x = (const float *) x->data;
++    a.w = (const float *) k->data;
++    a.y = (float *) dst->data;
++    a.IW = (int) x->ne[0];
++    a.IH = (int) x->ne[1];
++    a.IC = (int) x->ne[2];
++    a.OC = (int) k->ne[3];
++    a.OWp = (int) dst->ne[0];
++    a.OHp = (int) dst->ne[1];
++    a.pad_x = p[2];
++    a.pad_y = p[3];
++    // kernel element (kx, ky, ic, oc)
++    a.w_sx = (int64_t) (k->nb[0] / sizeof(float));
++    a.w_sy = (int64_t) (k->nb[1] / sizeof(float));
++    a.w_sc = (int64_t) (k->nb[2] / sizeof(float));
++    a.w_sn = (int64_t) (k->nb[3] / sizeof(float));
++    a.tap_y0 = 0; a.tap_ys = 1;
++    a.tap_x0 = 0; a.tap_xs = 1;
++    a.YW = a.OWp;
++    a.YH = a.OHp;
++    a.y_sy = 1; a.y_oy = 0;
++    a.y_sx = 1; a.y_ox = 0;
++    a.vec_store = (a.YW % 4 == 0) && ((uintptr_t) dst->data % 16 == 0);
++    a.in_scale  = conv_tile_vec_of(in_scale);
++    a.out_scale = conv_tile_vec_of(out_scale);
++    a.bias      = conv_tile_vec_of(bias);
++    a.leaky = has_leaky;
++    a.slope = slope;
++    a.w_vec = conv_tile_w_vec(a);
++    conv2d_tile_launch((int) k->ne[1], (int) k->ne[0], a, B, st);
++}
++
++bool ggml_cuda_conv_transpose_s2_supported(const ggml_tensor * convt) {
++    if (convt->op != GGML_OP_CONV_TRANSPOSE_2D) {
++        return false;
++    }
++    const ggml_tensor * k = convt->src[0];
++    const ggml_tensor * x = convt->src[1];
++    return k->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && convt->type == GGML_TYPE_F32 &&
++           ggml_is_contiguous(x) && ggml_is_contiguous(convt) && k->ne[0] == 3 && k->ne[1] == 3 &&
++           ((const int32_t *) convt->op_params)[0] == 2 && ggml_nelements(convt) < INT32_MAX;
++}
++
++// Stride-2 transposed 3 x 3 convolution, output 2H+1 x 2W+1. Per output
++// phase (ey, ex) it is a convolution on the input grid: for phase 0 the
++// taps are kernel rows 2, 0 over input rows i - 1, i (grid rows 0 .. H),
++// for phase 1 row 1 over row i (grid rows 0 .. H - 1); the same for the
++// columns. convt_s2_pair_f32 does grid rows < H and columns < W of both
++// column phases; conv2d_tile_f32 does the last even row and column.
++void ggml_cuda_conv_transpose_s2(ggml_backend_cuda_context & ctx, const ggml_tensor * convt, const ggml_tensor * x,
++                                 const ggml_tensor * in_scale, const ggml_tensor * out_scale, ggml_tensor * dst) {
++    const ggml_tensor * k = convt->src[0];   // (kx, ky, oc, ic)
++    cudaStream_t        st = ctx.stream();
++    const int B = (int) x->ne[3];
++    const int W = (int) x->ne[0], H = (int) x->ne[1];
++
++    conv_tile_args base = {};
++    base.x = (const float *) x->data;
++    base.w = (const float *) k->data;
++    base.y = (float *) dst->data;
++    base.IW = W;
++    base.IH = H;
++    base.IC = (int) x->ne[2];
++    base.OC = (int) k->ne[2];
++    base.w_sx = (int64_t) (k->nb[0] / sizeof(float));
++    base.w_sy = (int64_t) (k->nb[1] / sizeof(float));
++    base.w_sn = (int64_t) (k->nb[2] / sizeof(float));
++    base.w_sc = (int64_t) (k->nb[3] / sizeof(float));
++    base.YW = (int) dst->ne[0];
++    base.YH = (int) dst->ne[1];
++    base.y_sy = 2;
++    base.y_sx = 2;
++    base.vec_store = 0;
++    base.in_scale  = conv_tile_vec_of(in_scale);
++    base.out_scale = conv_tile_vec_of(out_scale);
++    base.w_vec = conv_tile_w_vec(base);
++
++    auto phase_y = [&](conv_tile_args & a, const int ey) {
++        a.pad_y = ey == 0 ? 1 : 0;
++        a.tap_y0 = ey == 0 ? 2 : 1;
++        a.tap_ys = ey == 0 ? -2 : 0;
++        a.y_oy = ey;
++    };
++    auto phase_x = [&](conv_tile_args & a, const int ex) {
++        a.pad_x = ex == 0 ? 1 : 0;
++        a.tap_x0 = ex == 0 ? 2 : 1;
++        a.tap_xs = ex == 0 ? -2 : 0;
++        a.y_ox = ex;
++    };
++
++    // interior: grid rows < H, columns < W, both column phases
++    for (int ey = 0; ey < 2; ++ey) {
++        conv_tile_args a = base;
++        phase_y(a, ey);
++        a.OWp = W;
++        a.OHp = H;
++        if (ey == 0) {
++            convt_s2_pair_launch<2>(a, B, st);
++        } else {
++            convt_s2_pair_launch<1>(a, B, st);
++        }
++    }
++    // last even column (grid column W, phase ex = 0), all rows of both row phases
++    for (int ey = 0; ey < 2; ++ey) {
++        conv_tile_args a = base;
++        phase_y(a, ey);
++        phase_x(a, 0);
++        a.ox_base = W;
++        a.OWp = W + 1;
++        a.OHp = ey == 0 ? H + 1 : H;
++        conv2d_tile_launch(ey == 0 ? 2 : 1, 2, a, B, st);
++    }
++    // last even row (grid row H, phase ey = 0), columns < W of both column phases
++    for (int ex = 0; ex < 2; ++ex) {
++        conv_tile_args a = base;
++        phase_y(a, 0);
++        phase_x(a, ex);
++        a.oy_base = H;
++        a.OHp = H + 1;
++        a.OWp = W;
++        conv2d_tile_launch(2, ex == 0 ? 2 : 1, a, B, st);
++    }
++}
+diff --git a/src/ggml-cuda/conv2d-tile.cuh b/src/ggml-cuda/conv2d-tile.cuh
+new file mode 100644
+index 00000000..46107889
+--- /dev/null
++++ b/src/ggml-cuda/conv2d-tile.cuh
+@@ -0,0 +1,38 @@
++#pragma once
++#include "common.cuh"
++
++// Direct F32 convolution with a shared-memory input tile, for the shapes of
++// a StyleGAN2-like decoder: stride 1, dilation 1, kernels up to 3 x 3, and
++// the stride-2 3 x 3 transposed convolution split into its four output
++// phases. Optional per-channel input scale (the modulation, applied to every
++// input value before the multiply), per-channel output scale (the
++// demodulation), per-channel bias and leaky ReLU in the epilogue.
++//
++// Every output is one fused multiply-add chain over (input channel, kernel
++// row, kernel column) in this order, starting at 0, in float32. The
++// prologue and the epilogue round each operation as the separate MUL, ADD
++// and LEAKY_RELU kernels do, so a fused call gives the same bits as the
++// separate ops followed by the implicit-GEMM convolution of conv2d.cu.
++
++// Channel vector [1, 1, C, 1 or B] (scale or bias) of a fused call.
++struct conv_tile_vec {
++    const float * d  = nullptr;
++    int           sb = 0;   // stride between batches (0: one vector for all)
++};
++
++// in_scale, out_scale, bias: [1, 1, C, 1 or B] tensors or nullptr.
++// leaky: apply leaky ReLU with this slope after the bias (when has_leaky).
++bool ggml_cuda_conv2d_tile_supported(const ggml_tensor * conv);
++void ggml_cuda_conv2d_tile(ggml_backend_cuda_context & ctx, const ggml_tensor * conv, const ggml_tensor * x,
++                           const ggml_tensor * in_scale, const ggml_tensor * out_scale, const ggml_tensor * bias,
++                           bool has_leaky, float slope, ggml_tensor * dst);
++
++// GGML_OP_CONV_TRANSPOSE_2D with a 3 x 3 kernel and stride 2 (any kernel
++// strides, so a permuted view works).
++bool ggml_cuda_conv_transpose_s2_supported(const ggml_tensor * convt);
++void ggml_cuda_conv_transpose_s2(ggml_backend_cuda_context & ctx, const ggml_tensor * convt, const ggml_tensor * x,
++                                 const ggml_tensor * in_scale, const ggml_tensor * out_scale, ggml_tensor * dst);
++
++// True when t is a contiguous F32 channel vector [1, 1, C, 1 or B] for an
++// activation of shape [., ., C, B].
++bool ggml_cuda_conv_tile_chan_vec_ok(const ggml_tensor * t, int64_t C, int64_t B);
+diff --git a/src/ggml-cuda/conv2d.cu b/src/ggml-cuda/conv2d.cu
+index fb70540b..25af0457 100644
+--- a/src/ggml-cuda/conv2d.cu
++++ b/src/ggml-cuda/conv2d.cu
+@@ -1,5 +1,6 @@
+ #include "conv2d.cuh"
+ #include "convert.cuh"
++#include "conv2d-tile.cuh"
+ 
+ struct conv_params {
+     const int64_t IW, IH;
+@@ -329,6 +330,19 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const float *       X_D    = (const float *) input->data;
+     float *             Y_D    = (float *) dst->data;
+ 
++#ifdef GGML_CUDA_CONV2D_TILE
++    // GGML_CUDA_CONV_TILE=0 keeps the implicit GEMM for the shapes it takes
++    // (contiguous kernels only).
++    static const bool tile = [] {
++        const char * e = getenv("GGML_CUDA_CONV_TILE");
++        return !(e && atoi(e) == 0);
++    }();
++    if ((tile || !ggml_is_contiguous(kernel)) && ggml_cuda_conv2d_tile_supported(dst)) {
++        ggml_cuda_conv2d_tile(ctx, dst, input, nullptr, nullptr, nullptr, false, 0.0f, dst);
++        return;
++    }
++#endif
++
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+     GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32);
+ 
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 3ec15c3b..d4fa8285 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -18,6 +18,7 @@
+ #include "ggml-cuda/conv2d-dw.cuh"
+ #include "ggml-cuda/grid-sample.cuh"
+ #include "ggml-cuda/chan-affine.cuh"
++#include "ggml-cuda/conv2d-tile.cuh"
+ #include "ggml-cuda/conv2d-transpose.cuh"
+ #include "ggml-cuda/convert.cuh"
+ #include "ggml-cuda/count-equal.cuh"
+@@ -3052,6 +3053,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+             ggml_cuda_op_grid_sample(ctx, dst);
+             break;
+         case GGML_OP_CONV_TRANSPOSE_2D:
++#ifdef GGML_CUDA_CONV2D_TILE
++            if (ggml_cuda_conv_transpose_s2_supported(dst)) {
++                ggml_cuda_conv_transpose_s2(ctx, dst, dst->src[1], nullptr, nullptr, dst);
++                break;
++            }
++#endif
+             ggml_cuda_conv_2d_transpose_p0(ctx, dst);
+             break;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+@@ -3839,6 +3846,127 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
+ }
+ 
++#ifdef GGML_CUDA_FUSE_DECODER
++// Fusions for a StyleGAN2-like decoder (GGML_CUDA_DEC_FUSE=0 turns them off):
++//   MUL(x, s) -> CONV_2D -> MUL(., d) -> ADD(., b) -> LEAKY_RELU   modulated conv with epilogue
++//   MUL(x, s) -> CONV_2D                                        modulated conv
++//   MUL(x, s) -> CONV_TRANSPOSE_2D (3 x 3, stride 2) [-> MUL(., d)]
++//   CONV_2D_DW -> ADD(., b) -> LEAKY_RELU                       blur with bias and activation
++//   GRID_SAMPLE -> MUL(., mask)
++//   MUL(x, mask) -> ADD(o, .)
++// s, d and b are channel vectors [1, 1, C, 1 or B]; mask is [W, H, 1, B].
++// Every fused kernel rounds each operation as the separate kernels do.
++static int ggml_cuda_try_fuse_decoder(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_DEC_FUSE");
++        return !(e && atoi(e) == 0);
++    }();
++    if (!enabled) {
++        return 0;
++    }
++    ggml_tensor * node = cgraph->nodes[i];
++    auto at = [&](const int k) -> ggml_tensor * {
++        return i + k < cgraph->n_nodes ? cgraph->nodes[i + k] : nullptr;
++    };
++    // node i + k is computed and used only by the next node of the group
++    auto inter = [&](const int k) {
++        ggml_tensor * t = at(k);
++        return t && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_node_has_n_uses(cgraph, i + k, 1);
++    };
++    auto computed = [&](const int k) {
++        ggml_tensor * t = at(k);
++        return t && (t->flags & GGML_TENSOR_FLAG_COMPUTE);
++    };
++    auto mem_ok = [&](const int count) {
++        int out = i + count - 1;
++        return ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &out, 1);
++    };
++    auto slope_of = [](const ggml_tensor * t) {
++        float v;
++        memcpy(&v, t->op_params, sizeof(float));
++        return v;
++    };
++
++    if (node->op == GGML_OP_MUL && node->type == GGML_TYPE_F32) {
++        ggml_tensor * x = node->src[0];
++        ggml_tensor * s = node->src[1];
++        ggml_tensor * c = at(1);
++        if (c && computed(1) && inter(0) && c->src[1] == node && x->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(x) && ggml_are_same_shape(x, node) &&
++            ggml_cuda_conv_tile_chan_vec_ok(s, x->ne[2], x->ne[3])) {
++            if (c->op == GGML_OP_CONV_2D && ggml_cuda_conv2d_tile_supported(c)) {
++                const ggml_tensor * k = c->src[0];
++                const bool small_1x1 = k->ne[0] == 1 && k->ne[1] == 1 && k->ne[3] <= 4;
++                ggml_tensor * m2 = at(2);
++                ggml_tensor * ad = at(3);
++                ggml_tensor * lk = at(4);
++                if (!small_1x1 && lk && inter(1) && inter(2) && inter(3) && computed(4) &&
++                    m2->op == GGML_OP_MUL && m2->src[0] == c &&
++                    ggml_cuda_conv_tile_chan_vec_ok(m2->src[1], c->ne[2], c->ne[3]) &&
++                    ad->op == GGML_OP_ADD && ad->src[0] == m2 &&
++                    ggml_cuda_conv_tile_chan_vec_ok(ad->src[1], c->ne[2], c->ne[3]) &&
++                    lk->op == GGML_OP_LEAKY_RELU && lk->src[0] == ad && lk->type == GGML_TYPE_F32 &&
++                    ggml_is_contiguous(lk) && ggml_are_same_shape(lk, c) && mem_ok(5)) {
++                    ggml_cuda_conv2d_tile(*cuda_ctx, c, x, s, m2->src[1], ad->src[1], true, slope_of(lk), lk);
++                    return 4;
++                }
++                if (mem_ok(2)) {
++                    ggml_cuda_conv2d_tile(*cuda_ctx, c, x, s, nullptr, nullptr, false, 0.0f, c);
++                    return 1;
++                }
++            }
++            if (c->op == GGML_OP_CONV_TRANSPOSE_2D && ggml_cuda_conv_transpose_s2_supported(c)) {
++                ggml_tensor * m2 = at(2);
++                if (m2 && inter(1) && computed(2) && m2->op == GGML_OP_MUL && m2->src[0] == c &&
++                    m2->type == GGML_TYPE_F32 && ggml_is_contiguous(m2) && ggml_are_same_shape(m2, c) &&
++                    ggml_cuda_conv_tile_chan_vec_ok(m2->src[1], c->ne[2], c->ne[3]) && mem_ok(3)) {
++                    ggml_cuda_conv_transpose_s2(*cuda_ctx, c, x, s, m2->src[1], m2);
++                    return 2;
++                }
++                if (mem_ok(2)) {
++                    ggml_cuda_conv_transpose_s2(*cuda_ctx, c, x, s, nullptr, c);
++                    return 1;
++                }
++            }
++        }
++        // element-wise: the output may coincide with x or o (in-place
++        // allocation), which the generic range check would refuse;
++        // ggml_cuda_mul_mask_add_supported checks the ranges itself
++        ggml_tensor * ad = at(1);
++        if (ad && computed(1) && inter(0) && ad->op == GGML_OP_ADD && ggml_cuda_mul_mask_add_supported(node, ad)) {
++            ggml_cuda_op_mul_mask_add(*cuda_ctx, node, ad);
++            return 1;
++        }
++        return 0;
++    }
++    if (node->op == GGML_OP_CONV_2D_DW) {
++        ggml_tensor * ad = at(1);
++        ggml_tensor * lk = at(2);
++        if (lk && inter(0) && inter(1) && computed(2) && ad->op == GGML_OP_ADD && ad->src[0] == node &&
++            ggml_are_same_shape(ad, node) && lk->op == GGML_OP_LEAKY_RELU && lk->src[0] == ad &&
++            lk->type == GGML_TYPE_F32 && ggml_is_contiguous(lk) &&
++            ggml_cuda_conv2d_dw_fused_supported(node, ad->src[1]) && mem_ok(3)) {
++            ggml_cuda_op_conv2d_dw_fused(*cuda_ctx, node, ad->src[1], true, slope_of(lk), lk);
++            return 2;
++        }
++        return 0;
++    }
++    if (node->op == GGML_OP_GRID_SAMPLE) {
++        ggml_tensor * mu = at(1);
++        if (mu && inter(0) && computed(1) && mu->op == GGML_OP_MUL && mu->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(mu) && ggml_are_same_shape(mu, node) && (mu->src[0] == node || mu->src[1] == node)) {
++            const ggml_tensor * mask = mu->src[0] == node ? mu->src[1] : mu->src[0];
++            if (ggml_cuda_grid_sample_mul_supported(node, mask) && mem_ok(2)) {
++                ggml_cuda_op_grid_sample_mul(*cuda_ctx, node, mask, mu);
++                return 1;
++            }
++        }
++        return 0;
++    }
++    return 0;
++}
++#endif // GGML_CUDA_FUSE_DECODER
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -3849,6 +3977,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++#ifdef GGML_CUDA_FUSE_DECODER
++    {
++        const int n = ggml_cuda_try_fuse_decoder(cuda_ctx, cgraph, i);
++        if (n != 0) {
++            return n;
++        }
++    }
++#endif
++
+ #ifdef GGML_CUDA_FUSE_CHAN_AFFINE
+     {
+         const enum ggml_op mal[3] = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_LEAKY_RELU };
+@@ -4255,7 +4392,118 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
++#ifdef GGML_CUDA_OP_PROFILE
++// Per-op time profile (ggml_backend_cuda_op_profile_enable/read, through the
++// registry's get_proc_address): each dispatch, a single node or a fused
++// group, is bracketed by CUDA events; CUDA graphs are off while it is on.
++// Keys: the ops of the dispatch joined by '+', the output width and the
++// output channels of its last node.
++struct ggml_cuda_op_prof {
++    bool on = false;
++    std::vector<cudaEvent_t> events;
++    size_t used = 0;
++    struct span {
++        cudaEvent_t a, b;
++        std::string key;
++    };
++    std::vector<span> spans;
++    std::map<std::string, std::pair<double, long>> acc;
++
++    cudaEvent_t event() {
++        if (used == events.size()) {
++            cudaEvent_t e;
++            CUDA_CHECK(cudaEventCreate(&e));
++            events.push_back(e);
++        }
++        return events[used++];
++    }
++    cudaEvent_t begin(cudaStream_t st) {
++        cudaEvent_t e = event();
++        CUDA_CHECK(cudaEventRecord(e, st));
++        return e;
++    }
++    void end(cudaEvent_t a, const ggml_cgraph * g, const int i0, const int i1, cudaStream_t st) {
++        cudaEvent_t b = event();
++        CUDA_CHECK(cudaEventRecord(b, st));
++        std::string key;
++        for (int k = i0; k <= i1; ++k) {
++            const ggml_tensor * t = g->nodes[k];
++            if (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
++                t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE) {
++                continue;
++            }
++            if (!key.empty()) {
++                key += "+";
++            }
++            key += ggml_op_desc(t);
++        }
++        const ggml_tensor * last = g->nodes[i1];
++        char buf[64];
++        snprintf(buf, sizeof(buf), " w=%lld c=%lld", (long long) last->ne[0], (long long) last->ne[2]);
++        key += buf;
++        spans.push_back({ a, b, key });
++    }
++    void collect(cudaStream_t st) {
++        CUDA_CHECK(cudaStreamSynchronize(st));
++        for (const span & s : spans) {
++            float ms = 0.0f;
++            CUDA_CHECK(cudaEventElapsedTime(&ms, s.a, s.b));
++            auto & e = acc[s.key];
++            e.first += ms;
++            e.second += 1;
++        }
++        spans.clear();
++        used = 0;
++    }
++};
++
++static std::mutex ggml_cuda_op_prof_mutex;
++static std::map<const ggml_backend_cuda_context *, ggml_cuda_op_prof *> ggml_cuda_op_prof_map;
++
++static ggml_cuda_op_prof * ggml_cuda_op_prof_get(const ggml_backend_cuda_context * ctx, const bool create) {
++    std::lock_guard<std::mutex> lock(ggml_cuda_op_prof_mutex);
++    auto it = ggml_cuda_op_prof_map.find(ctx);
++    if (it != ggml_cuda_op_prof_map.end()) {
++        return it->second;
++    }
++    if (!create) {
++        return nullptr;
++    }
++    ggml_cuda_op_prof * p = new ggml_cuda_op_prof();
++    ggml_cuda_op_prof_map[ctx] = p;
++    return p;
++}
++
++static void ggml_backend_cuda_op_profile_enable(ggml_backend_t backend, bool on) {
++    ggml_cuda_op_prof * p = ggml_cuda_op_prof_get((const ggml_backend_cuda_context *) backend->context, on);
++    if (p) {
++        p->on = on;
++    }
++}
++
++// Calls cb for every key with the summed time in ms and the number of
++// dispatches, then clears the profile.
++static void ggml_backend_cuda_op_profile_read(ggml_backend_t backend,
++                                              void (*cb)(void * ud, const char * key, double ms, long count),
++                                              void * ud) {
++    ggml_cuda_op_prof * p = ggml_cuda_op_prof_get((const ggml_backend_cuda_context *) backend->context, false);
++    if (!p) {
++        return;
++    }
++    for (const auto & kv : p->acc) {
++        cb(ud, kv.first.c_str(), kv.second.first, kv.second.second);
++    }
++    p->acc.clear();
++}
++#endif // GGML_CUDA_OP_PROFILE
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++#ifdef GGML_CUDA_OP_PROFILE
++    ggml_cuda_op_prof * prof = ggml_cuda_op_prof_get(cuda_ctx, false);
++    if (prof && (!prof->on || use_cuda_graph)) {
++        prof = nullptr;
++    }
++#endif
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+@@ -4401,9 +4649,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++#ifdef GGML_CUDA_OP_PROFILE
++                cudaEvent_t prof_ev = prof ? prof->begin(cuda_ctx->stream()) : nullptr;
++#endif
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++#ifdef GGML_CUDA_OP_PROFILE
++                    if (prof) {
++                        prof->end(prof_ev, cgraph, i, i + nodes_to_skip, cuda_ctx->stream());
++                    }
++#endif
+                     i += nodes_to_skip;
+                     continue;
+                 }
+@@ -4425,6 +4681,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++#ifdef GGML_CUDA_OP_PROFILE
++                if (prof) {
++                    prof->end(prof_ev, cgraph, i, i, cuda_ctx->stream());
++                }
++#endif
+ 
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+@@ -4530,6 +4791,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     }
+ #endif // USE_CUDA_GRAPH
+ 
++#ifdef GGML_CUDA_OP_PROFILE
++    ggml_cuda_op_prof * prof = ggml_cuda_op_prof_get(cuda_ctx, false);
++    if (prof && prof->on) {
++        use_cuda_graph = false;
++        cuda_graph_update_required = false;
++    }
++#endif
++
+     if (use_cuda_graph && cuda_graph_update_required) {
+         // Start CUDA graph capture
+         {
+@@ -4542,6 +4811,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++#ifdef GGML_CUDA_OP_PROFILE
++    if (prof && prof->on) {
++        prof->collect(cuda_ctx->stream());
++    }
++#endif
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -5637,6 +5912,26 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+     GGML_UNUSED(reg);
+ }
+ 
++#ifdef GGML_CUDA_STREAM_PRIORITY
++// Runs the backend's work on streams of the greatest priority of the device:
++// when two backends share the GPU, the block scheduler then serves this one
++// first. Waits for the backend and recreates its streams.
++static void ggml_backend_cuda_set_high_priority(ggml_backend_t backend, bool high) {
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
++        for (int st = 0; st < GGML_CUDA_MAX_STREAMS; ++st) {
++            if (ctx->streams[d][st] != nullptr) {
++                CUDA_CHECK(cudaStreamSynchronize(ctx->streams[d][st]));
++                CUDA_CHECK(cudaStreamDestroy(ctx->streams[d][st]));
++                ctx->streams[d][st] = nullptr;
++            }
++        }
++    }
++    ctx->high_priority = high;
++}
++#endif
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+@@ -5660,6 +5955,19 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++#ifdef GGML_CUDA_STREAM_PRIORITY
++    if (strcmp(name, "ggml_backend_cuda_set_high_priority") == 0) {
++        return (void *)ggml_backend_cuda_set_high_priority;
++    }
++#endif
++#ifdef GGML_CUDA_OP_PROFILE
++    if (strcmp(name, "ggml_backend_cuda_op_profile_enable") == 0) {
++        return (void *)ggml_backend_cuda_op_profile_enable;
++    }
++    if (strcmp(name, "ggml_backend_cuda_op_profile_read") == 0) {
++        return (void *)ggml_backend_cuda_op_profile_read;
++    }
++#endif
+     return nullptr;
+ }
+ 
+diff --git a/src/ggml-cuda/grid-sample.cu b/src/ggml-cuda/grid-sample.cu
+index f0f6660e..9915f28d 100644
+--- a/src/ggml-cuda/grid-sample.cu
++++ b/src/ggml-cuda/grid-sample.cu
+@@ -11,7 +11,8 @@
+ // stores are coalesced and the gathers hit the same cache lines.
+ static __global__ void grid_sample_f32(const float * __restrict__ feat, const float * __restrict__ grid,
+                                        float * __restrict__ dst, const int w_in, const int h_in, const int c,
+-                                       const int b_feat, const int w, const int h, const int b) {
++                                       const int b_feat, const int w, const int h, const int b,
++                                       const float * __restrict__ mask) {
+     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+     const int64_t grid_plane = (int64_t) w * h;
+     if (i >= grid_plane * b) {
+@@ -47,6 +48,8 @@ static __global__ void grid_sample_f32(const float * __restrict__ feat, const fl
+     const int64_t plane = (int64_t) w_in * h_in;
+     const float * src = feat + (b_feat == 1 ? 0 : (int64_t) bi * plane * c);
+     float * out = dst + (int64_t) bi * c * grid_plane + pix;
++    // fused MUL by a mask [w, h, 1, b], rounded as the separate kernel
++    const float m = mask ? mask[(int64_t) bi * grid_plane + pix] : 1.0f;
+     for (int ch = 0; ch < c; ++ch) {
+         const float v_nw = m_nw ? __ldg(src + o_nw) : 0.0f;
+         const float v_ne = m_ne ? __ldg(src + o_ne) : 0.0f;
+@@ -56,14 +59,18 @@ static __global__ void grid_sample_f32(const float * __restrict__ feat, const fl
+         acc = __fmaf_rn(v_ne, w_ne, acc);
+         acc = __fmaf_rn(v_sw, w_sw, acc);
+         acc = __fmaf_rn(v_se, w_se, acc);
++        if (mask) {
++            acc = __fmul_rn(acc, m);
++        }
+         out[(int64_t) ch * grid_plane] = acc;
+         src += plane;
+     }
+ }
+ 
+-void ggml_cuda_op_grid_sample(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-    const ggml_tensor * feat = dst->src[0];
+-    const ggml_tensor * grid = dst->src[1];
++static void grid_sample_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * gs, const float * mask,
++                               ggml_tensor * dst) {
++    const ggml_tensor * feat = gs->src[0];
++    const ggml_tensor * grid = gs->src[1];
+     GGML_ASSERT(feat->type == GGML_TYPE_F32 && grid->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+     GGML_ASSERT(ggml_is_contiguous(feat) && ggml_is_contiguous(grid) && ggml_is_contiguous(dst));
+ 
+@@ -74,5 +81,19 @@ void ggml_cuda_op_grid_sample(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     const int64_t blocks = (total + CUDA_GRID_SAMPLE_BLOCK_SIZE - 1) / CUDA_GRID_SAMPLE_BLOCK_SIZE;
+     grid_sample_f32<<<blocks, CUDA_GRID_SAMPLE_BLOCK_SIZE, 0, ctx.stream()>>>(
+         (const float *) feat->data, (const float *) grid->data, (float *) dst->data,
+-        (int) feat->ne[0], (int) feat->ne[1], (int) feat->ne[2], (int) feat->ne[3], w, h, b);
++        (int) feat->ne[0], (int) feat->ne[1], (int) feat->ne[2], (int) feat->ne[3], w, h, b, mask);
++}
++
++void ggml_cuda_op_grid_sample(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    grid_sample_launch(ctx, dst, nullptr, dst);
++}
++
++bool ggml_cuda_grid_sample_mul_supported(const ggml_tensor * gs, const ggml_tensor * mask) {
++    return mask->type == GGML_TYPE_F32 && ggml_is_contiguous(mask) && mask->ne[0] == gs->ne[0] &&
++           mask->ne[1] == gs->ne[1] && mask->ne[2] == 1 && mask->ne[3] == gs->ne[3];
++}
++
++void ggml_cuda_op_grid_sample_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * gs, const ggml_tensor * mask,
++                                  ggml_tensor * dst) {
++    grid_sample_launch(ctx, gs, (const float *) mask->data, dst);
+ }
+diff --git a/src/ggml-cuda/grid-sample.cuh b/src/ggml-cuda/grid-sample.cuh
+index 6cc58531..77c7686c 100644
+--- a/src/ggml-cuda/grid-sample.cuh
++++ b/src/ggml-cuda/grid-sample.cuh
+@@ -4,3 +4,9 @@
+ #define CUDA_GRID_SAMPLE_BLOCK_SIZE 256
+ 
+ void ggml_cuda_op_grid_sample(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// GRID_SAMPLE followed by MUL with a mask [W, H, 1, B] (broadcast over the
++// channels), in one pass.
++bool ggml_cuda_grid_sample_mul_supported(const ggml_tensor * gs, const ggml_tensor * mask);
++void ggml_cuda_op_grid_sample_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * gs, const ggml_tensor * mask,
++                                  ggml_tensor * dst);

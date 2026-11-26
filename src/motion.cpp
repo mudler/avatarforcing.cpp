@@ -23,6 +23,12 @@
 // - upfirdn2d (blur, up = 1): depthwise convolution with the 2-D kernel.
 // - upfirdn2d (up = 2): zero insertion, padding, depthwise convolution.
 // - The base grid of each ToFlow level is built once at load time.
+//
+// On a GPU backend the decoder graph differs (gpu_graph_, see styled_conv()):
+// the transposed conv is one ggml_conv_transpose_2d_p0 and the 3x3 weights
+// are read through a transposed copy, so that the CUDA backend can fuse the
+// modulation, demodulation, bias and activation into the convolutions. The
+// float operations and their order are the same as in the CPU graph.
 
 namespace af {
 
@@ -165,6 +171,9 @@ bool MotionModel::load(const std::string& gguf_path) {
     // Convolution path (see conv2d()).
     const char* cm = std::getenv("AVATARFORCING_CONV");
     im2col_ = cm && std::strcmp(cm, "im2col") == 0;
+    // AVATARFORCING_DEC_GRAPH=legacy keeps the CPU decoder graph on a GPU.
+    const char* dg = std::getenv("AVATARFORCING_DEC_GRAPH");
+    gpu_graph_ = !be_.is_cpu() && !im2col_ && !(dg && std::strcmp(dg, "legacy") == 0);
     if (!loader_.load(gguf_path, be_.handle(), {"mae."})) return false;
     const int L = (int)cfg_.dec_n_levels;
 
@@ -231,23 +240,27 @@ bool MotionModel::build_derived() {
     for (uint32_t c : cfg_.enc_channels) cmax = std::max(cmax, c);
     for (uint32_t c : cfg_.dec_channels) cmax = std::max(cmax, c);
 
-    ggml_init_params p = { ggml_tensor_overhead() * (4 * L + L + 2 * L + 1 + 8), nullptr, true };
+    ggml_init_params p = { ggml_tensor_overhead() * (4 * L + L + 2 * L + 1 + (2 * L + 1) + 8), nullptr, true };
     dctx_ = ggml_init(p);
     blur_down_ = ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, kb, kb, 1, cmax);
     blur_up_ = ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, kb, kb, 1, cmax);
     for (int l = 0; l < L; ++l) {
         const StyledConv& c = convs_[2 * l];
         const int64_t ci = c.w->ne[2], co = c.w->ne[3];
-        for (int ey = 0; ey < 2; ++ey)
-            for (int ex = 0; ex < 2; ++ex)
-                convs_[2 * l].phase[ey][ex] =
-                    ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, ex == 0 ? 2 : 1, ey == 0 ? 2 : 1, ci, co);
+        if (!gpu_graph_)
+            for (int ey = 0; ey < 2; ++ey)
+                for (int ex = 0; ex < 2; ++ex)
+                    convs_[2 * l].phase[ey][ex] =
+                        ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, ex == 0 ? 2 : 1, ey == 0 ? 2 : 1, ci, co);
         const int n = 8 << l;
         grids_.push_back(ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, n, n, 2, 1));
     }
     std::vector<StyledConv*> styled_all = {&conv1_};
     for (StyledConv& c : convs_) styled_all.push_back(&c);
     for (StyledConv* c : styled_all) c->gbias = ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, 1, 1, c->act_b->ne[0], 1);
+    if (gpu_graph_)
+        for (StyledConv* c : styled_all)
+            c->wt = ggml_new_tensor_4d(dctx_, GGML_TYPE_F32, c->w->ne[3], c->w->ne[0], c->w->ne[1], c->w->ne[2]);
     dbuf_ = ggml_backend_alloc_ctx_tensors(dctx_, be_.handle());
     if (!dbuf_) { AF_LOG("motion: derived buffer allocation failed"); return false; }
 
@@ -275,7 +288,7 @@ bool MotionModel::build_derived() {
     // Phase kernels of the stride-2 transposed conv. For output parity e the
     // contributing taps are k = 2, 0 (e = 0, as a 2-tap correlation over the
     // input padded by 1) or k = 1 (e = 1).
-    for (int l = 0; l < L; ++l) {
+    for (int l = 0; l < L && !gpu_graph_; ++l) {
         StyledConv& c = convs_[2 * l];
         const int64_t ci = c.w->ne[2], co = c.w->ne[3];
         std::vector<float> w = get_host(c.w);   // [co][ci][3][3]
@@ -294,6 +307,20 @@ bool MotionModel::build_derived() {
                 ggml_backend_tensor_set(c.phase[ey][ex], k.data(), 0, ggml_nbytes(c.phase[ey][ex]));
             }
     }
+
+    // GPU graph: every 3x3 weight [co][ci][kh][kw] also as [ci][kh][kw][co]
+    // (ggml shape [co, kw, kh, ci]); the convolutions read it through a
+    // permuted view, with the output channel as the fastest index.
+    if (gpu_graph_)
+        for (StyledConv* c : styled_all) {
+            const int64_t kw = c->w->ne[0], kh = c->w->ne[1], ci = c->w->ne[2], co = c->w->ne[3];
+            std::vector<float> w = get_host(c->w), t(w.size());
+            for (int64_t o = 0; o < co; ++o)
+                for (int64_t i = 0; i < ci; ++i)
+                    for (int64_t k = 0; k < kh * kw; ++k)
+                        t[(i * kh * kw + k) * co + o] = w[(o * ci + i) * kh * kw + k];
+            ggml_backend_tensor_set(c->wt, t.data(), 0, ggml_nbytes(c->wt));
+        }
 
     // act_gain * activation bias, float32 (as ggml_scale computes it), shaped
     // [1, 1, C, 1]: a leaf of the graph, so that the MUL, ADD and LEAKY_RELU
@@ -379,14 +406,72 @@ ggml_tensor* MotionModel::upsample(ggml_context* ctx, ggml_tensor* x) const {
     return ggml_conv_2d_dw_direct(ctx, k, t, 1, 1, 0, 0, 1, 1);
 }
 
+// GPU graph of a StyledConv, the same operations as styled_conv() below:
+//   MUL(x, s) -> CONV_2D(3x3) -> MUL(., g / d) -> ADD(., g * b) -> LEAKY_RELU
+//   MUL(x, s) -> CONV_TRANSPOSE_2D(3x3, stride 2) -> MUL(., g / d)
+//            -> CONV_2D_DW(blur, padding p0) -> ADD(., g * b) -> LEAKY_RELU
+// The style vectors and the views are expanded into the graph first, so
+// that each chain is a run of consecutive nodes, which the CUDA backend
+// fuses into one kernel (or two for the transposed conv). The transposed
+// conv gives the 2H+1 output directly; the blur pads it with zeros by
+// (p0, p1), like the phase graph with its extra zero row and the pad.
+ggml_tensor* MotionModel::styled_conv_gpu(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* x, ggml_tensor* s,
+                                          const StyledConv& c, bool up) const {
+    const int64_t B = x->ne[3], ci = c.w->ne[2], co = c.w->ne[3];
+    ggml_tensor* s4 = ggml_reshape_4d(ctx, s, 1, 1, ci, B);
+    ggml_tensor* d = ggml_mul_mat(ctx, c.wsq, ggml_sqr(ctx, s));                  // [co, B]
+    d = ggml_sqrt(ctx, ggml_scale_bias(ctx, d, 1.0f, cfg_.demod_eps));
+    ggml_tensor* gd = ggml_div(ctx, ggml_scale_bias(ctx, d, 0.0f, cfg_.act_gain), d);   // g / d
+    ggml_tensor* gd4 = ggml_reshape_4d(ctx, gd, 1, 1, co, B);
+    // [co, kw, kh, ci] -> [kw, kh, ci, co] (conv) or [kw, kh, co, ci] (transposed conv)
+    ggml_tensor* w = up ? ggml_permute(ctx, c.wt, 2, 0, 1, 3) : ggml_permute(ctx, c.wt, 3, 0, 1, 2);
+    ggml_build_forward_expand(gf, s4);
+    ggml_build_forward_expand(gf, gd4);
+    ggml_build_forward_expand(gf, w);
+    ggml_tensor* xs = ggml_mul(ctx, x, s4);
+    ggml_tensor* y;
+    // The fused kernels read x instead of xs, so x must stay allocated until
+    // the convolution has run: an extra source keeps the graph allocator
+    // from giving its memory to the convolution output (the ggml kernels
+    // ignore src[2] of these ops).
+    if (!up) {
+        const int pad = (int)(c.w->ne[0] / 2);
+        y = ggml_conv_2d_direct(ctx, w, xs, 1, 1, pad, pad, 1, 1);
+        y->src[2] = x;
+        y = ggml_mul(ctx, y, gd4);
+    } else {
+        y = ggml_conv_transpose_2d_p0(ctx, w, xs, 2);                      // [2W+1, 2H+1, co, B]
+        y->src[2] = x;
+        y = ggml_mul(ctx, y, gd4);
+        const int p0 = cfg_.pad_dec_up_conv[0], p1 = cfg_.pad_dec_up_conv[1];
+        const int kb = (int)blur_up_->ne[0];
+        ggml_tensor* k = ggml_view_4d(ctx, blur_up_, kb, kb, 1, co, blur_up_->nb[1], blur_up_->nb[2],
+                                      blur_up_->nb[3], 0);
+        int pad = p0;
+        if (p0 != p1) {
+            y = ggml_pad_ext(ctx, y, p0, p1, p0, p1, 0, 0, 0, 0);
+            pad = 0;
+        }
+        ggml_build_forward_expand(gf, k);
+        ggml_build_forward_expand(gf, y);
+        y = ggml_conv_2d_dw_direct(ctx, k, y, 1, 1, pad, pad, 1, 1);
+    }
+    y = ggml_add(ctx, y, c.gbias);
+    // In place: the graph allocator then keeps the result in the memory of
+    // the convolution output, which never overlaps the inputs of the chain
+    // (a condition of the fused kernels).
+    return ggml_leaky_relu(ctx, y, cfg_.leaky_slope, true);
+}
+
 // StyledConv: modulated, demodulated conv (3x3, or stride-2 transposed 3x3 +
 // blur when up), then FusedLeakyReLU. Noise injection is identity (noise is
 // never given).
-ggml_tensor* MotionModel::styled_conv(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style,
+ggml_tensor* MotionModel::styled_conv(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* x, ggml_tensor* style,
                                       const StyledConv& c, bool up, ggml_tensor** s_out) const {
     const int64_t B = x->ne[3], ci = c.w->ne[2], co = c.w->ne[3];
     ggml_tensor* s = ggml_add(ctx, ggml_mul_mat(ctx, c.mod_w, style), c.mod_b);   // [ci, B]
     if (s_out) *s_out = s;
+    if (gpu_graph_ && gf) return styled_conv_gpu(ctx, gf, x, s, c, up);
     ggml_tensor* xs = ggml_mul(ctx, x, ggml_reshape_4d(ctx, s, 1, 1, ci, B));
     ggml_tensor* y;
     if (!up) {
@@ -544,6 +629,8 @@ bool MotionModel::decode_styles(const float* style, int n, std::vector<float>& p
         auto tap = [&](const std::string& name, ggml_tensor* t) {
             if (!want_taps) return;
             ggml_set_output(t);
+            // an in-place result (a view) lives in the memory of its source
+            if (t->view_src) ggml_set_output(t->view_src);
             tapped.emplace_back(name, t);
         };
         auto build = [&](Backend::Graph& g) {
@@ -551,16 +638,16 @@ bool MotionModel::decode_styles(const float* style, int n, std::vector<float>& p
             ggml_tensor* st = g.input(style + (size_t)f0 * D, D, B);
             ggml_tensor* x = ggml_repeat(ctx, const_in_, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 4, 4, const_in_->ne[2], B));
             ggml_tensor* s = nullptr;
-            x = styled_conv(ctx, x, st, conv1_, false, &s);
+            x = styled_conv(ctx, g.gf, x, st, conv1_, false, &s);
             tap("conv1.style", s);
             tap("conv1", x);
             ggml_tensor *flow_raw = nullptr, *skip = nullptr;
             for (int l = 0; l < L; ++l) {
                 const std::string p = idx("level.%d.", l);
-                x = styled_conv(ctx, x, st, convs_[2 * l], true, &s);
+                x = styled_conv(ctx, g.gf, x, st, convs_[2 * l], true, &s);
                 tap(p + "up.style", s);
                 tap(p + "up", x);
-                x = styled_conv(ctx, x, st, convs_[2 * l + 1], false, &s);
+                x = styled_conv(ctx, g.gf, x, st, convs_[2 * l + 1], false, &s);
                 tap(p + "conv.style", s);
                 tap(p + "conv", x);
 
@@ -569,8 +656,9 @@ bool MotionModel::decode_styles(const float* style, int n, std::vector<float>& p
                 const int64_t C = x->ne[2], H = x->ne[1], W = x->ne[0];
                 s = ggml_add(ctx, ggml_mul_mat(ctx, tf.mod_w, st), tf.mod_b);
                 tap(p + "toflow.style", s);
-                ggml_tensor* fr = conv2d(ctx, tf.w, ggml_mul(ctx, x, ggml_reshape_4d(ctx, s, 1, 1, C, B)),
-                                                      1, 1, 0, 0, 1, 1);
+                ggml_tensor* s4 = ggml_reshape_4d(ctx, s, 1, 1, C, B);
+                if (gpu_graph_) ggml_build_forward_expand(g.gf, s4);   // MUL and CONV_2D adjacent
+                ggml_tensor* fr = conv2d(ctx, tf.w, ggml_mul(ctx, x, s4), 1, 1, 0, 0, 1, 1);
                 fr = ggml_add(ctx, fr, ggml_reshape_4d(ctx, tf.b, 1, 1, tf.b->ne[0], 1));
                 if (flow_raw) fr = ggml_add(ctx, fr, upsample(ctx, flow_raw));
                 flow_raw = fr;
@@ -581,6 +669,7 @@ bool MotionModel::decode_styles(const float* style, int n, std::vector<float>& p
                 ggml_tensor* mask = ggml_cont(ctx, ggml_view_4d(ctx, fr, W, H, 1, B, fr->nb[1], fr->nb[2], fr->nb[3],
                                                                 2 * fr->nb[2]));
                 mask = ggml_sigmoid(ctx, mask);
+                if (gpu_graph_) ggml_build_forward_expand(g.gf, mask);   // GRID_SAMPLE and MUL adjacent
                 ggml_tensor* warp = ggml_mul(ctx, grid_sample_bilinear_zeros(ctx, feats_[l], flow), mask);
                 tap(p + "warp", warp);
                 x = ggml_add(ctx, warp, ggml_mul(ctx, x, ggml_scale_bias(ctx, mask, -1.0f, 1.0f)));
