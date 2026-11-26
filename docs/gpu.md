@@ -201,9 +201,12 @@ The convolution kernels:
   row parity; each thread computes 4 input columns times both output column
   parities (8 consecutive output columns) times 8 channels, from one tile of
   the input. The taps are the phase taps (kernel rows and columns 2, 0 for
-  even outputs, 1 for odd ones), in the order of the phase convolutions. The
-  last even row and column (2H, 2W) are thin strips done by the tiled
-  convolution.
+  even outputs, 1 for odd ones), in the order of the phase convolutions.
+  The results go through shared memory, so that each warp stores whole
+  output rows instead of 8 floats per channel plane per thread. The last
+  even row and column (2H, 2W) take one thread per output and channel
+  (`convt_s2_edge_f32`); the taps that fall outside the input add an exact
+  zero in the phase convolutions, so they are skipped there.
 
 ## Concurrency
 
@@ -332,23 +335,24 @@ sampler priority), measured with the same build.
 | | nfe 6 before | nfe 6 now | nfe 10 before | nfe 10 now |
 |---|---|---|---|---|
 | sampler, steady block, alone | 71 ms | 70 ms | 123 ms | 124 ms |
-| decoder, block of 10 frames, alone | 338 ms | 162 ms (16 ms per frame) | 338 ms | 162 ms |
-| period between finished blocks, no overlap | 481 ms | 307 ms | 537 ms | 361 ms |
-| period between finished blocks, overlap (default) | 383 ms | 208 ms | 436 ms | 253 ms |
-| decoder block during overlap | 338 ms | 210 ms | 338 ms | 228 ms |
-| sampler block during overlap | 383 ms | 184 ms | 436 ms | 256 ms |
-| primer (50 frames) | 146 ms | 148 ms | 262 ms | 262 ms |
-| first block latency (primer + first decoded block) | 566 ms | 395 ms | 688 ms | 518 ms |
-| realtime factor, generate, overlap | 0.99 | 0.55 | 1.11 | 0.66 |
-| realtime factor with the model load, overlap | 1.04 | 0.60 | 1.16 | 0.71 |
-| realtime factor, generate, no overlap | 1.23 | 0.79 | 1.35 | 0.91 |
+| decoder, block of 10 frames, alone | 338 ms | 155 ms (16 ms per frame) | 338 ms | 155 ms |
+| period between finished blocks, no overlap | 481 ms | 301 ms | 537 ms | 355 ms |
+| period between finished blocks, overlap (default) | 383 ms | 202 ms | 436 ms | 241 ms |
+| decoder block during overlap | 338 ms | 204 ms | 338 ms | 222 ms |
+| sampler block during overlap | 383 ms | 179 ms | 436 ms | 248 ms |
+| primer (50 frames) | 146 ms | 151 ms | 262 ms | 262 ms |
+| first block latency (primer + first decoded block) | 566 ms | 394 ms | 688 ms | 509 ms |
+| realtime factor, generate, overlap | 0.99 | 0.54 | 1.11 | 0.63 |
+| realtime factor with the model load, overlap | 1.04 | 0.61 | 1.16 | 0.69 |
+| realtime factor, generate, no overlap | 1.23 | 0.77 | 1.35 | 0.89 |
 
 With overlap the steady state is now below real time with margin at both
 nfe 6 and nfe 10. The period is set by the decoder, which shares the GPU
-with the sampler: 210 ms per block instead of 162 ms alone. The sampler's
+with the sampler: 204 ms per block instead of 155 ms alone. The sampler's
 high-priority streams take part of the GPU first: with normal priority the
-period is 222 ms at nfe 6 and 277 ms at nfe 10 (sampler 223 and 277 ms per
-block, decoder 172 ms). Without overlap the period also contains the uint8
+period was 222 ms at nfe 6 and 277 ms at nfe 10 (sampler 223 and 277 ms per
+block, decoder 172 ms; measured before the last transposed-convolution
+change). Without overlap the period also contains the uint8
 conversion and the ffmpeg write, about 75 ms per block.
 
 Other stages: model load 0.56 s, portrait encoder 65 ms, audio features
@@ -361,48 +365,52 @@ memory, so the device buffers do not appear in the RSS.
 
 The CPU MVP needed 0.56 s per frame for the decoder and 0.19 s per steady
 block for the sampler (realtime factor 15.6); on the GPU the decoder is now
-35 times faster and the sampler 3 times.
+36 times faster and the sampler 3 times.
 
 ### Where the decoder time goes
 
 `--profile` on the 7.9 s clip (20 decoder graphs), per block of 10 frames.
 The times are CUDA event times per kernel launch with CUDA graphs off, so
-they include launch gaps: the sum is 340 ms before and 197 ms now, against
-338 ms and 162 ms for a block in a normal run.
+they include launch gaps: the sum is 340 ms before and 191 ms now, against
+338 ms and 155 ms for a block in a normal run.
 
 | Op (before) | ms per block | | Op (now) | ms per block |
 |---|---|---|---|---|
-| `CONV_2D` (implicit GEMM) | 203.0 | | `MUL+CONV_TRANSPOSE_2D+MUL` | 67.1 |
-| `MUL` | 31.6 | | `MUL+CONV_2D+MUL+ADD+LEAKY_RELU` | 67.1 |
-| `PAD` | 26.6 | | `CONV_2D_DW+ADD+LEAKY_RELU` | 19.5 |
-| `CONCAT` | 23.7 | | `MUL+ADD` (warp update) | 10.2 |
+| `CONV_2D` (implicit GEMM) | 203.0 | | `MUL+CONV_2D+MUL+ADD+LEAKY_RELU` | 66.9 |
+| `MUL` | 31.6 | | `MUL+CONV_TRANSPOSE_2D+MUL` | 59.4 |
+| `PAD` | 26.6 | | `CONV_2D_DW+ADD+LEAKY_RELU` | 20.5 |
+| `CONCAT` | 23.7 | | `MUL+ADD` (warp update) | 10.1 |
 | `MUL+ADD+LEAKY_RELU` | 11.7 | | `GRID_SAMPLE+MUL` | 8.2 |
 | `ADD+LEAKY_RELU` | 10.6 | | `MUL+CONV_2D` (ToFlow) | 4.7 |
 | `CONV_2D_DW` | 10.3 | | `CONV_2D` (ToRGB) | 4.2 |
-| `ADD` | 8.2 | | `ADD` | 3.1 |
-| `GRID_SAMPLE` | 6.9 | | `CONCAT`, `PAD`, `CONV_2D_DW` (skip and flow upsampling) | 5.7 |
-| others | 7.4 | | others | 7.3 |
+| `ADD` | 8.2 | | `ADD` | 3.2 |
+| `GRID_SAMPLE` | 6.9 | | `CONCAT`, `PAD`, `CONV_2D_DW` (skip and flow upsampling) | 5.8 |
+| others | 7.4 | | others | 7.8 |
 
 The convolutions by level, now (from 32 x 32 to 512 x 512 each level does
-about 48 GFLOP per block in the 3 x 3 convolution and 24 GFLOP in the
-transposed one):
+about 48 GFLOP per block in the 3 x 3 convolution; the transposed
+convolution does 24 GFLOP from 65 x 65 up and 12 GFLOP at 33 x 33):
 
 | Output | 3 x 3 conv, fused | transposed conv, fused | blur, fused |
 |---|---|---|---|
-| 512 x 512, 32 ch | 12.3 ms | 14.8 ms (513 wide) | 8.6 ms |
-| 256 x 256, 64 ch | 12.9 ms | 12.1 ms | 4.7 ms |
-| 128 x 128, 128 ch | 12.1 ms | 11.4 ms | 2.3 ms |
-| 64 x 64, 256 ch | 12.2 ms | 12.1 ms | 1.4 ms |
-| 32 x 32, 512 ch | 11.7 ms | 10.0 ms | 1.3 ms |
-| 16 x 16, 512 ch | 3.1 ms | 3.8 ms | 0.8 ms |
-| 8 x 8, 512 ch | 1.5 ms | 3.0 ms | |
-| 4 x 4, 512 ch (`conv1`) | 1.2 ms | | |
+| 512 x 512, 32 ch | 12.4 ms | 12.7 ms (513 wide) | 9.8 ms |
+| 256 x 256, 64 ch | 12.3 ms | 11.0 ms | 4.7 ms |
+| 128 x 128, 128 ch | 11.9 ms | 11.1 ms | 2.3 ms |
+| 64 x 64, 256 ch | 12.1 ms | 12.2 ms | 1.4 ms |
+| 32 x 32, 512 ch | 12.2 ms | 8.0 ms | 1.4 ms |
+| 16 x 16, 512 ch | 3.1 ms | 2.9 ms | 0.7 ms |
+| 8 x 8, 512 ch | 1.5 ms | 1.7 ms | |
+| 4 x 4, 512 ch (`conv1`) | 1.3 ms | | |
 
-The 3 x 3 kernel runs at about 4 TFLOPS, the transposed one at 1.6 to
-2.4 TFLOPS. A plain FMA loop on this GPU reaches 6.9 TFLOPS (best of 20
-runs), so there is room left, mostly in the transposed convolution.
+The 3 x 3 kernel runs at about 4 TFLOPS, the transposed one at 1.5 to
+2.2 TFLOPS. A plain FMA loop on this GPU reaches 6.9 TFLOPS (best of 20
+runs), so there is room left, mostly in the transposed convolution. Three
+changes to it gave no measurable gain and were dropped: warps that share
+one channel group (broadcast weight reads), one tap at a time in the inner
+loop (fewer live registers), and the largest shared-memory carveout. Its
+limit is not yet understood; a profiler with hardware counters would tell.
 
-The steps that brought the decoder from 790 ms to 162 ms per block:
+The steps that brought the decoder from 790 ms to 155 ms per block:
 
 | Change | Decoder, ms per block |
 |---|---|
@@ -416,6 +424,7 @@ The steps that brought the decoder from 790 ms to 162 ms per block:
 | decoder fusions (first version; the 3 x 3 epilogue and the blur fusion did not apply yet) | 221 |
 | transposed convolution with both column phases per block, in-place leaky ReLU, convolution inputs kept allocated (all fusions apply), 16-byte weight copies, depthwise blur 4 rows per thread | 165 |
 | modulation applied once per tile chunk, larger channel chunks for the one-row transposed phase, cheaper warp update | 162 |
+| transposed convolution: one edge kernel instead of 8-wide tiles for the last row and column, output rows staged through shared memory | 155 |
 
 The `im2col` + cuBLAS path (`AVATARFORCING_CONV=im2col`) took 806 ms per
 block when the first implicit-GEMM kernel took 625 ms.

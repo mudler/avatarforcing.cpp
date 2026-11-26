@@ -275,10 +275,10 @@ index b5d5a69d..568fab18 100644
 +                                  bool has_leaky, float slope, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/conv2d-tile.cu b/src/ggml-cuda/conv2d-tile.cu
 new file mode 100644
-index 00000000..57b04b44
+index 00000000..a613d5b6
 --- /dev/null
 +++ b/src/ggml-cuda/conv2d-tile.cu
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,778 @@
 +#include "conv2d-tile.cuh"
 +
 +// See conv2d-tile.cuh. Layout: input [W, H, IC, B], output [W, H, OC, B]
@@ -580,9 +580,10 @@ index 00000000..57b04b44
 +// Column 2j takes the taps kx = 2, 0 over input columns j - 1, j, column
 +// 2j + 1 the tap kx = 1 over column j; rows likewise with the taps of the
 +// phase (a.tap_y0, a.tap_ys, a.pad_y). Covers i < a.OHp, j < a.OWp; the last
-+// even row and column (2H, 2W) are done by conv2d_tile_f32 strips. Each
-+// thread: 4 grid columns (8 output columns) times 8 channels. The sums are
-+// the same chains as the phase convolutions.
++// even row and column (2H, 2W) are done by convt_s2_edge_f32. Each thread:
++// 4 grid columns (8 output columns) times 8 channels. The sums are the same
++// chains as the phase convolutions. The results go through shared memory,
++// so that every warp writes whole output rows.
 +template <int KH, int TH, int TW, int BN, bool SCALE>
 +static __global__ void __launch_bounds__((TW / 4) * TH * (BN / 8))
 +convt_s2_pair_f32(const conv_tile_args a) {
@@ -596,9 +597,19 @@ index 00000000..57b04b44
 +    constexpr int KK = KH * 3;         // per row tap: kx = 2, 0 (even column), 1 (odd column)
 +    constexpr int XS = CI * SH * SW;
 +    constexpr int WS = CI * KK * BN;
++    constexpr int XSP = (XS + 3) & ~3;         // keeps the weights 16-byte aligned
++    constexpr int RW = 2 * TW + 1;             // staged output row (padded)
++    constexpr int STAGE = NG * TH * RW;
++    constexpr int SMEM = 2 * XSP + 2 * WS > STAGE ? 2 * XSP + 2 * WS : STAGE;
 +
-+    __shared__ __align__(16) float xs[2][CI][SH][SW];
-+    __shared__ __align__(16) float ws[2][CI][KK][BN];
++    // input tiles, weight tiles; reused for the output staging at the end
++    __shared__ __align__(16) float sm[SMEM];
++    auto xs = [&](const int buf, const int c, const int r, const int col) -> float & {
++        return sm[buf * XSP + (c * SH + r) * SW + col];
++    };
++    auto ws = [&](const int buf, const int c, const int kk, const int n) -> float * {
++        return &sm[2 * XSP + buf * WS + (c * KK + kk) * BN + n];
++    };
 +
 +    const int tid = threadIdx.x;
 +    const int tn  = tid % NG;
@@ -626,7 +637,7 @@ index 00000000..57b04b44
 +            const int col = rem - r * SW;
 +            const int ic = ic0 + c, iy = iy0 + r, ix = ix0 + col;
 +            const bool ok = ic < a.IC && iy >= 0 && iy < a.IH && ix >= 0 && ix < a.IW;
-+            conv_tile_cp_f32(&xs[buf][c][r][col], ok ? xb + ((int64_t) ic * a.IH + iy) * a.IW + ix : a.x, ok);
++            conv_tile_cp_f32(&xs(buf, c, r, col), ok ? xb + ((int64_t) ic * a.IH + iy) * a.IW + ix : a.x, ok);
 +        }
 +        const int vs = a.w_vec ? 2 : 0;   // log2 of the copy width in floats
 +        for (int i = tid; i < (WS >> vs); i += NT) {
@@ -642,9 +653,9 @@ index 00000000..57b04b44
 +            const float * src = a.w + on * a.w_sn + ic * a.w_sc + (int64_t) (a.tap_y0 + ky * a.tap_ys) * a.w_sy +
 +                                (int64_t) kx * a.w_sx;
 +            if (a.w_vec) {
-+                conv_tile_cp_f32x4(&ws[buf][c][kk][n], ok ? src : a.w, ok);
++                conv_tile_cp_f32x4(ws(buf, c, kk, n), ok ? src : a.w, ok);
 +            } else {
-+                conv_tile_cp_f32(&ws[buf][c][kk][n], ok ? src : a.w, ok);
++                conv_tile_cp_f32(ws(buf, c, kk, n), ok ? src : a.w, ok);
 +            }
 +        }
 +        conv_tile_cp_commit();
@@ -673,7 +684,7 @@ index 00000000..57b04b44
 +            // (its copies are complete after the wait), x * s rounded as MUL
 +            for (int i = tid; i < XS; i += NT) {
 +                const int ic = ch * CI + i / (SH * SW);
-+                float * p = &xs[buf][0][0][0] + i;
++                float * p = &sm[buf * XSP + i];
 +                *p = __fmul_rn(*p, ic < a.IC ? a.in_scale.d[b * a.in_scale.sb + ic] : 0.0f);
 +            }
 +        }
@@ -685,13 +696,13 @@ index 00000000..57b04b44
 +                float av[PX + 1];
 +#pragma unroll
 +                for (int j = 0; j < PX + 1; ++j) {
-+                    av[j] = xs[buf][c][tr + ky][tc + j];
++                    av[j] = xs(buf, c, tr + ky, tc + j);
 +                }
 +                float bv[3][8];
 +#pragma unroll
 +                for (int t = 0; t < 3; ++t) {
-+                    const float4 b0 = *reinterpret_cast<const float4 *>(&ws[buf][c][ky * 3 + t][tn * 4]);
-+                    const float4 b1 = *reinterpret_cast<const float4 *>(&ws[buf][c][ky * 3 + t][BN / 2 + tn * 4]);
++                    const float4 b0 = *reinterpret_cast<const float4 *>(ws(buf, c, ky * 3 + t, tn * 4));
++                    const float4 b1 = *reinterpret_cast<const float4 *>(ws(buf, c, ky * 3 + t, BN / 2 + tn * 4));
 +                    bv[t][0] = b0.x; bv[t][1] = b0.y; bv[t][2] = b0.z; bv[t][3] = b0.w;
 +                    bv[t][4] = b1.x; bv[t][5] = b1.y; bv[t][6] = b1.z; bv[t][7] = b1.w;
 +                }
@@ -711,27 +722,86 @@ index 00000000..57b04b44
 +        __syncthreads();
 +    }
 +
-+    const int oy = oy0 + tr;
-+    const int ox = ox0 + tc;
-+    if (oy >= a.OHp || ox >= a.OWp) {
-+        return;
-+    }
++    // Output: for each of the 8 channel slots of a thread, the block stages
++    // NG channels x TH rows x 2 TW columns and writes them row by row. The
++    // loop above ends with a barrier, so the tiles are free.
 +    const bool has_sc = a.out_scale.d != nullptr;
++    const int rows_v = min(TH, a.OHp - oy0);
++    const int cols_v = 2 * min(TW, a.OWp - ox0);
 +#pragma unroll
 +    for (int e = 0; e < 8; ++e) {
-+        const int n = n0 + (e < 4 ? tn * 4 + e : BN / 2 + tn * 4 + e - 4);
-+        if (n >= a.OC) {
-+            continue;
-+        }
-+        const float sc = has_sc ? a.out_scale.d[b * a.out_scale.sb + n] : 1.0f;
-+        float * yrow = a.y + (((int64_t) b * a.OC + n) * a.YH + (int64_t) oy * a.y_sy + a.y_oy) * a.YW;
++        const int ne = n0 + (e < 4 ? tn * 4 + e : BN / 2 + tn * 4 + e - 4);
++        const float sc = has_sc && ne < a.OC ? a.out_scale.d[b * a.out_scale.sb + ne] : 1.0f;
++        float * srow = &sm[(tn * TH + tr) * RW + 2 * tc];
 +#pragma unroll
 +        for (int j = 0; j < 2 * PX; ++j) {
-+            if (ox + j / 2 < a.OWp) {
-+                yrow[2 * ox + j] = conv_tile_epilogue(acc[j][e], sc, 0.0f, has_sc, false, 0, 0.0f);
++            srow[j] = conv_tile_epilogue(acc[j][e], sc, 0.0f, has_sc, false, 0, 0.0f);
++        }
++        __syncthreads();
++        for (int i = tid; i < NG * TH * 2 * TW; i += NT) {
++            const int col = i % (2 * TW);
++            const int rg  = i / (2 * TW);    // g * TH + r
++            const int r   = rg % TH;
++            const int g   = rg / TH;
++            const int n   = n0 + (e < 4 ? g * 4 + e : BN / 2 + g * 4 + e - 4);
++            if (r < rows_v && col < cols_v && n < a.OC) {
++                a.y[(((int64_t) b * a.OC + n) * a.YH + (int64_t) (oy0 + r) * a.y_sy + a.y_oy) * a.YW + 2 * ox0 + col] =
++                    sm[rg * RW + col];
++            }
++        }
++        __syncthreads();
++    }
++}
++
++// The last even row and column of the stride-2 transposed convolution:
++// outputs (r, 2W) for r <= 2H and (2H, c) for c < 2W, one thread each
++// (output channel fastest). Same chain as the phase convolutions: input
++// channels, then the row taps and the column taps of the phase in order;
++// taps outside the input add an exact zero there, so they are skipped.
++template <bool SCALE>
++static __global__ void convt_s2_edge_f32(const conv_tile_args a, const int B) {
++    const int W = a.IW, H = a.IH;
++    const int P = 2 * H + 1 + 2 * W;
++    int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int n = (int) (idx % a.OC);
++    idx /= a.OC;
++    const int p = (int) (idx % P);
++    const int b = (int) (idx / P);
++    if (b >= B) {
++        return;
++    }
++    const int r = p <= 2 * H ? p : 2 * H;
++    const int c = p <= 2 * H ? 2 * W : p - (2 * H + 1);
++    // even position 2i: taps 2, 0 over input i - 1, i; odd 2i + 1: tap 1 over i
++    const int i = r >> 1, j = c >> 1;
++    const int nty = (r & 1) ? 1 : 2, ntx = (c & 1) ? 1 : 2;
++    const int ty[2] = { (r & 1) ? 1 : 2, 0 }, iy[2] = { (r & 1) ? i : i - 1, i };
++    const int tx[2] = { (c & 1) ? 1 : 2, 0 }, ix[2] = { (c & 1) ? j : j - 1, j };
++    const float * xb = a.x + (int64_t) b * a.IC * H * W;
++    const float * wn = a.w + (int64_t) n * a.w_sn;
++    float acc = 0.0f;
++    for (int ic = 0; ic < a.IC; ++ic) {
++        const float s = SCALE ? a.in_scale.d[b * a.in_scale.sb + ic] : 1.0f;
++        for (int u = 0; u < nty; ++u) {
++            if (iy[u] < 0 || iy[u] >= H) {
++                continue;
++            }
++            for (int v = 0; v < ntx; ++v) {
++                if (ix[v] < 0 || ix[v] >= W) {
++                    continue;
++                }
++                float x = xb[((int64_t) ic * H + iy[u]) * W + ix[v]];
++                if (SCALE) {
++                    x = __fmul_rn(x, s);
++                }
++                acc = __fmaf_rn(x, wn[ic * a.w_sc + (int64_t) ty[u] * a.w_sy + (int64_t) tx[v] * a.w_sx], acc);
 +            }
 +        }
 +    }
++    if (a.out_scale.d) {
++        acc = __fmul_rn(acc, a.out_scale.d[b * a.out_scale.sb + n]);
++    }
++    a.y[(((int64_t) b * a.OC + n) * a.YH + r) * a.YW + c] = acc;
 +}
 +
 +template <int KH, int TH, int TW, int BN>
@@ -928,7 +998,7 @@ index 00000000..57b04b44
 +// taps are kernel rows 2, 0 over input rows i - 1, i (grid rows 0 .. H),
 +// for phase 1 row 1 over row i (grid rows 0 .. H - 1); the same for the
 +// columns. convt_s2_pair_f32 does grid rows < H and columns < W of both
-+// column phases; conv2d_tile_f32 does the last even row and column.
++// column phases; convt_s2_edge_f32 does the last even row and column.
 +void ggml_cuda_conv_transpose_s2(ggml_backend_cuda_context & ctx, const ggml_tensor * convt, const ggml_tensor * x,
 +                                 const ggml_tensor * in_scale, const ggml_tensor * out_scale, ggml_tensor * dst) {
 +    const ggml_tensor * k = convt->src[0];   // (kx, ky, oc, ic)
@@ -963,12 +1033,6 @@ index 00000000..57b04b44
 +        a.tap_ys = ey == 0 ? -2 : 0;
 +        a.y_oy = ey;
 +    };
-+    auto phase_x = [&](conv_tile_args & a, const int ex) {
-+        a.pad_x = ex == 0 ? 1 : 0;
-+        a.tap_x0 = ex == 0 ? 2 : 1;
-+        a.tap_xs = ex == 0 ? -2 : 0;
-+        a.y_ox = ex;
-+    };
 +
 +    // interior: grid rows < H, columns < W, both column phases
 +    for (int ey = 0; ey < 2; ++ey) {
@@ -982,25 +1046,15 @@ index 00000000..57b04b44
 +            convt_s2_pair_launch<1>(a, B, st);
 +        }
 +    }
-+    // last even column (grid column W, phase ex = 0), all rows of both row phases
-+    for (int ey = 0; ey < 2; ++ey) {
-+        conv_tile_args a = base;
-+        phase_y(a, ey);
-+        phase_x(a, 0);
-+        a.ox_base = W;
-+        a.OWp = W + 1;
-+        a.OHp = ey == 0 ? H + 1 : H;
-+        conv2d_tile_launch(ey == 0 ? 2 : 1, 2, a, B, st);
-+    }
-+    // last even row (grid row H, phase ey = 0), columns < W of both column phases
-+    for (int ex = 0; ex < 2; ++ex) {
-+        conv_tile_args a = base;
-+        phase_y(a, 0);
-+        phase_x(a, ex);
-+        a.oy_base = H;
-+        a.OHp = H + 1;
-+        a.OWp = W;
-+        conv2d_tile_launch(2, ex == 0 ? 2 : 1, a, B, st);
++    // last even row and column
++    {
++        const int64_t n = (int64_t) (2 * H + 1 + 2 * W) * base.OC * B;
++        const dim3 grid((unsigned) ((n + 255) / 256));
++        if (base.in_scale.d) {
++            convt_s2_edge_f32<true><<<grid, 256, 0, st>>>(base, B);
++        } else {
++            convt_s2_edge_f32<false><<<grid, 256, 0, st>>>(base, B);
++        }
 +    }
 +}
 diff --git a/src/ggml-cuda/conv2d-tile.cuh b/src/ggml-cuda/conv2d-tile.cuh
