@@ -323,6 +323,31 @@ bool request_options(avatarforcing_ctx* ctx, const char* json, af::GenOptions& g
             live_keys = true;
             continue;
         }
+        if (session && (k == "live_reanchor_every" || k == "live_reanchor_max_defer" ||
+                        k == "live_reanchor_fade_frames")) {
+            if (!as_int(k, kv.second, i, err)) return false;
+            if (i < 0 || i > 1000000) { err = "option \"" + k + "\" must be 0 to 1000000"; return false; }
+            if (k == "live_reanchor_every") session->lo.reanchor_every = (int)i;
+            else if (k == "live_reanchor_max_defer") session->lo.reanchor_max_defer = (int)i;
+            else session->lo.reanchor_fade_frames = (int)i;
+            live_keys = true;
+            continue;
+        }
+        if (session && k == "live_reanchor_fade") {
+            std::string m;
+            if (!as_string(k, kv.second, m, err)) return false;
+            if (m == "latent") session->lo.reanchor_fade = af::ReanchorFade::Latent;
+            else if (m == "pixel") session->lo.reanchor_fade = af::ReanchorFade::Pixel;
+            else if (m == "none") session->lo.reanchor_fade = af::ReanchorFade::None;
+            else { err = "option \"live_reanchor_fade\" must be \"latent\", \"pixel\" or \"none\""; return false; }
+            live_keys = true;
+            continue;
+        }
+        if (session && k == "live_reanchor_hold") {
+            if (!as_bool(k, kv.second, session->lo.reanchor_hold, err)) return false;
+            live_keys = true;
+            continue;
+        }
         bool handled = false;
         if (!apply_request_option(k, kv.second, g, handled, err)) return false;
         if (!handled) { err = "unknown request option \"" + k + "\""; return false; }
@@ -852,6 +877,13 @@ int64_t avatarforcing_session_interrupt(avatarforcing_session* s, int64_t at_fra
     avatarforcing_ctx* ctx = s->ctx;
     if (!s->live) { set_error(ctx, "not a live session (open it with \"live\": true)"); return -1; }
     return s->live->interrupt(at_frame);
+}
+
+int64_t avatarforcing_session_reanchor(avatarforcing_session* s) {
+    if (!s) return -1;
+    avatarforcing_ctx* ctx = s->ctx;
+    if (!s->live) { set_error(ctx, "not a live session (open it with \"live\": true)"); return -1; }
+    return s->live->request_reanchor();
 }
 
 char* avatarforcing_session_stats_json(avatarforcing_session* s) {

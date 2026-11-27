@@ -258,6 +258,19 @@ AVATARFORCING_API void avatarforcing_session_close(avatarforcing_session* s);
  *                                   (default 3)
  *   "live_max_ahead_seconds"  int   a phrase must end at most this far after
  *                                   the next block (default 30)
+ *   "live_reanchor_every"     int   steady blocks before a reanchor when the
+ *                                   face is idle; 0: none (default 112, from
+ *                                   the GGUF)
+ *   "live_reanchor_max_defer" int   steady blocks before a reanchor also in
+ *                                   speech; 0: none (default 162)
+ *   "live_reanchor_fade"      string fade after a reanchor: "latent"
+ *                                   (default), "pixel" (the live app's RGB
+ *                                   cross-fade) or "none" (see below)
+ *   "live_reanchor_fade_frames" int fade frames after a reanchor; 0: no fade
+ *                                   (default 25)
+ *   "live_reanchor_hold"      bool  true: the reanchor block repeats the last
+ *                                   frame, as the live app does; false
+ *                                   (default): it is computed (see below)
  * In a live session "audio_mode" defaults to "raw", as in the live app.
  *
  * Frames. Frame indices are int64_t and count from 0, the first frame of the
@@ -292,8 +305,33 @@ AVATARFORCING_API void avatarforcing_session_close(avatarforcing_session* s);
  * (also one that waits for the lock) when an interrupt comes returns
  * AVATARFORCING_LIVE_DROPPED.
  *
- * Not in live mode yet: the reanchor (a fresh primer every 112 blocks),
- * which the live app needs for calls of more than about a minute. */
+ * Reanchor. In a long call the face drifts away from the portrait, because
+ * the model feeds on its own output. As the live app does, a step from time
+ * to time is a reanchor: a fresh primer on the features of the 50 frames
+ * that end with the block, which resets the caches. The policy is the live
+ * app's: a reanchor comes before a block when live_reanchor_every steady
+ * blocks (about 45 s) have passed and no phrase covers the block or comes
+ * after it, or when live_reanchor_max_defer steady blocks (about 65 s) have
+ * passed, also in speech. avatarforcing_session_reanchor asks for one at the
+ * next step. The reanchor block has block_frames frames, as any block: the
+ * end of the new primer, or with "live_reanchor_hold" the last frame
+ * repeated, as in the live app. Because the face can jump there, the
+ * live_reanchor_fade_frames frames from the first frame of the new caches on
+ * (the reanchor block, or the block after a held one) are faded:
+ *   "latent": the decoder input (the motion latent) goes from the motion of
+ *             the last frame before the fade to the new motion, on a
+ *             raised-cosine curve: a blend in the reanchor block, then an
+ *             offset that dies away on top of the new motion. Each frame
+ *             shows one face, and the lip-sync goes on through the fade
+ *             (docs/capi.md, "Reanchor").
+ *   "pixel":  the live app's cross-fade in RGB, linear, from the last frame
+ *             before the fade, whose copy is the first frame of the fade.
+ *             When the pose changed, both faces show at once.
+ * A reanchor step takes longer than a steady step (a primer of 50 frames
+ * instead of 10): on an NVIDIA Thor about 280 ms at nfe 6 and 390 ms at
+ * nfe 10, for a block of 400 ms. Use nfe 6 in live mode, or step two blocks
+ * ahead of playback at nfe 10. Frames before the first reanchor do not
+ * change. */
 
 /* step: the frame queue is full; nothing was computed. */
 #define AVATARFORCING_LIVE_QUEUE_FULL (-2)
@@ -325,14 +363,26 @@ AVATARFORCING_API int64_t avatarforcing_session_step(avatarforcing_session* s);
  * wait for a running step. */
 AVATARFORCING_API int64_t avatarforcing_session_interrupt(avatarforcing_session* s, int64_t at_frame);
 
+/* Asks for a reanchor at the next step, whatever the policy (for example
+ * when the caller knows that playback is idle). Returns the first frame of
+ * that step, or -1 when s is not a live session. Does not wait for a running
+ * step. */
+AVATARFORCING_API int64_t avatarforcing_session_reanchor(avatarforcing_session* s);
+
 /* A JSON object with the state of a live session:
  *   {"next_frame":40,"speech_end":115,"pending_phrases":1,
  *    "queued_frames":10,"ready_frames":10,"queue_frames":30,"blocks":4,
  *    "speech_blocks":1,"queue_full":0,"phrases":1,"dropped_phrases":0,
- *    "interrupts":0,"last_step_ms":350.2,"max_step_ms":410.0}
+ *    "interrupts":0,"last_step_ms":350.2,"max_step_ms":410.0,
+ *    "reanchors":0,"last_reanchor_frame":-1,"blocks_since_reanchor":4,
+ *    "reanchor_every":112,"reanchor_max_defer":162,
+ *    "reanchor_fade_frames":25,"reanchor_fade":"latent",
+ *    "last_reanchor_ms":0.0,"max_reanchor_ms":0.0}
  * next_frame: the first frame of the next step. speech_end: the end of the
  * last phrase (next_frame when none is pending). queued_frames: frames that
- * wait for pull, ready or in the decoder. Free the string with
+ * wait for pull, ready or in the decoder. last_reanchor_frame: the first
+ * frame of the last reanchor block (-1: none yet). blocks_since_reanchor:
+ * steady blocks since the primer or the last reanchor. Free the string with
  * avatarforcing_free_string. NULL on error. */
 AVATARFORCING_API char* avatarforcing_session_stats_json(avatarforcing_session* s);
 

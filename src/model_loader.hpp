@@ -25,6 +25,10 @@ struct FlowConfig {
     uint32_t cross_cache_len = 0;   // cross-attention KV cache length
     uint32_t kv_shift = 0;          // self cache left shift per steady block
     uint32_t first_steady_start_pos = 0;
+    // live app reanchor (optional keys; the defaults are the live app values)
+    uint32_t reanchor_every = 112;       // blocks between reanchors, when idle
+    uint32_t reanchor_max_defer = 162;   // blocks after which a reanchor is forced
+    uint32_t reanchor_fade_frames = 25;  // cross-fade length after a reanchor
     // flow transformer
     uint32_t dim_w = 0, dim_h = 0, dim_a = 0;
     uint32_t depth = 0, n_heads = 0, head_dim = 0, mlp_hidden = 0;

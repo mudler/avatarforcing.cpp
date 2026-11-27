@@ -23,8 +23,12 @@ set_tests_properties(test_wav2vec2_parity PROPERTIES LABELS "model" TIMEOUT 1800
 af_add_test(test_quant)
 set_tests_properties(test_quant PROPERTIES LABELS "model" TIMEOUT 1800)
 
-# Live mode feature schedule; needs no model.
+# Live mode feature schedule, reanchor policy and cross-fade; needs no model.
 af_add_test(test_live_schedule)
+
+# Live mode reanchor on a model.
+af_add_test(test_live_reanchor)
+set_tests_properties(test_live_reanchor PROPERTIES LABELS "model" TIMEOUT 3600)
 
 # The C API test is plain C and links the shared library.
 if(TARGET avatarforcing_shared)

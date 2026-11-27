@@ -4,7 +4,10 @@
 // 400 ms of video). Each step computes exactly one block: lip-sync where a
 // phrase covers the block, the idle features of the GGUF elsewhere. The
 // primer runs at open() on idle features and is not output; frame 0 is the
-// first frame of the first step. See docs/capi.md, "Live mode".
+// first frame of the first step. A reanchor (a fresh primer in place of a
+// block) resets the caches from time to time, as the live app does, so that
+// a long call does not drift away from the portrait. See docs/capi.md, "Live
+// mode".
 
 #include "pipeline.hpp"
 
@@ -18,10 +21,48 @@
 
 namespace af {
 
+// The fade after a reanchor. Latent: the decoder input moves from the old
+// motion to the new one (Generator::latent_fade_weight), so every frame is
+// one face. Pixel: the live app's RGB cross-fade from the last frame
+// (crossfade()), which shows two faces at once when the pose changed.
+enum class ReanchorFade { Latent, Pixel, None };
+
 struct LiveOptions {
     int queue_blocks = 3;        // blocks that may wait for pull_frames, >= 1
     int max_ahead_seconds = 30;  // a phrase must end at most this far after next()
+    // Reanchor policy (ReanchorPolicy). < 0: the GGUF value, which is the live
+    // app value (112, 162, 25).
+    int reanchor_every = -1;        // steady blocks before an idle reanchor; 0: none
+    int reanchor_max_defer = -1;    // steady blocks before a forced reanchor; 0: none
+    int reanchor_fade_frames = -1;  // fade frames after a reanchor; 0: no fade
+    ReanchorFade reanchor_fade = ReanchorFade::Latent;
+    // false: the reanchor block is the decoded end of the new primer. true:
+    // it repeats the last frame, as the live app does (it skips the output of
+    // the reanchor because its primer takes longer than a block there).
+    bool reanchor_hold = false;
 };
+
+// When the live app reanchors. `since` counts the steady blocks after the
+// primer or the last reanchor. Before a block, a reanchor is due when it is
+// asked for, when since >= every and the face is idle (no phrase covers the
+// block or comes after it), or when since >= max_defer, also in speech.
+struct ReanchorPolicy {
+    int every = 0, max_defer = 0;
+    int since = 0;
+
+    bool due(bool idle, bool requested) const {
+        return requested || (every > 0 && since >= every && idle) || (max_defer > 0 && since >= max_defer);
+    }
+    // After each block: reanchored or a steady block.
+    void done(bool reanchored) { since = reanchored ? 0 : since + 1; }
+};
+
+// The cross-fade of the live app after a reanchor: frame k (0-based) of the
+// fade is (r / total) * anchor + (1 - r / total) * frame for r = total - k,
+// in float32, clipped to [0, 255] and truncated, as numpy does it. The
+// anchor is the last frame before the fade. remaining: r, from total to 1.
+// frame: n bytes, blended in place.
+void crossfade(const uint8_t* anchor, uint8_t* frame, size_t n, int remaining, int total);
 
 // The audio features of a live session, indexed by frame. Frame 0 is the
 // first output frame; the hidden primer covers frames -clip .. -1. A frame
@@ -78,7 +119,8 @@ private:
 
 // One live session on an engine. Calls that compute (open, push_phrase, step)
 // run one at a time: a lock in the session serializes them. interrupt,
-// epoch, frames_ready, pull and stats_json do not wait for that lock.
+// request_reanchor, epoch, frames_ready, pull and stats_json do not wait for
+// that lock.
 class LiveSession {
 public:
     static constexpr int64_t kQueueFull = -2;   // step: the frame queue is full
@@ -122,6 +164,12 @@ public:
     bool failed(std::string* err = nullptr) const;
     std::string stats_json();
 
+    // Asks for a reanchor at the next step, whatever the policy. Returns the
+    // first frame of that step. Does not wait for a running step.
+    int64_t request_reanchor();
+    // The first frame of the last reanchor block, -1 before the first.
+    int64_t last_reanchor_frame() const;
+
     size_t frame_bytes() const { return frame_bytes_; }
     int block_frames() const { return nb_; }
     int queue_frames() const { return queue_cap_; }
@@ -129,6 +177,7 @@ public:
 
 private:
     void set_failed(const std::string& err);
+    bool sink(const uint8_t* rgb, int n);
 
     Engine& e_;
     GenOptions go_;
@@ -147,10 +196,21 @@ private:
     std::atomic<uint64_t> epoch_{0};
     int64_t blocks_ = 0, speech_blocks_ = 0, queue_full_ = 0, interrupts_ = 0, phrases_ = 0, dropped_ = 0;
     double last_step_ms_ = 0, max_step_ms_ = 0;
+    ReanchorPolicy policy_;
+    int fade_frames_ = 0;
+    std::atomic<bool> reanchor_req_{false};
+    int64_t reanchors_ = 0, last_reanchor_ = -1;
+    double last_reanchor_ms_ = 0, max_reanchor_ms_ = 0;
 
-    std::mutex q_mu_;   // ready_, produced_, pulled_
+    std::mutex q_mu_;   // ready_, produced_, pulled_, the output state below
     std::deque<std::vector<uint8_t>> ready_;
     int64_t produced_ = 0, pulled_ = 0;   // frames handed to the decoder, frames pulled
+    // Output (the frame sink): the index of the next frame, the last frame,
+    // and the cross-fades that start at a frame.
+    int64_t out_frame_ = 0;
+    std::vector<uint8_t> last_, anchor_;
+    std::deque<int64_t> fades_;
+    int fade_left_ = 0;
 
     std::atomic<bool> failed_{false};
     mutable std::mutex err_mu_;

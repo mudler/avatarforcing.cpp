@@ -29,6 +29,7 @@ The model has three parts:
 | M7 | CUDA backend: the whole pipeline on the GPU in float32, parity-gated; faster than real time on an NVIDIA Thor (one 400 ms block every 202 ms at nfe 6, 241 ms at nfe 10) | done |
 | M8 | C API: `libavatarforcing` with `include/avatarforcing.h`, offline generation to RGB frames or mp4, streaming sessions; the CLI and the API share one pipeline | done |
 | M9 | Live mode: a session that the caller steps once per block, with idle features between phrases, a hidden primer, interrupt and a bounded frame queue; `avatarforcing-cli --live` simulates a call | done |
+| M10 | Live reanchor: a fresh primer every 112 blocks when idle (at the latest after 162), as the live app does, so a long call does not drift; a 25-frame fade of the motion hides the seam (the live app's RGB cross-fade is an option) | done |
 | M11 | Quantized GGUF: `avatarforcing-quantize` (F16, Q8_0, K types) with a per-tensor type policy, `test_quant` against F32, end-to-end SSIM gates; F16 passes, Q8_0 does not (`docs/quantization.md`) | done |
 
 The C++ library holds all three parts in F32 or F16 (`docs/quantization.md`)
@@ -144,7 +145,8 @@ ctest --test-dir build --output-on-failure
 `test_flow_parity` and `test_sampler_parity` read the flow baseline,
 `test_motion_parity` the motion baseline and `test_wav2vec2_parity` the
 wav2vec2 baseline. `test_capi` and `test_capi_live` need only the model
-GGUF (`docs/capi.md`). `test_live_schedule` needs no model. `test_quant`
+GGUF (`docs/capi.md`), and so does `test_live_reanchor`. `test_live_schedule`
+needs no model. `test_quant`
 compares an F16 or quantized GGUF (`AVATARFORCING_TEST_QUANT_GGUF`) with the
 F32 GGUF on the inputs of the flow and wav2vec2 baselines
 (`docs/quantization.md`).

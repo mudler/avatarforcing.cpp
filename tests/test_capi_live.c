@@ -10,7 +10,8 @@
  *     the idle parts (needs AVATARFORCING_TEST_PORTRAIT, a real face);
  *   - determinism: the two runs give the same frames;
  *   - a live session leaves the offline path unchanged: the same clip before
- *     and after it gives the same frames.
+ *     and after it gives the same frames;
+ *   - the reanchor options and stats (test_live_reanchor tests the reanchor).
  *
  * Needs AVATARFORCING_TEST_GGUF; exits 77 (skip) when it is unset.
  * Optional: AVATARFORCING_TEST_PORTRAIT (a 512x512 face image; else a
@@ -223,6 +224,10 @@ static int run_call(avatarforcing_ctx* ctx, const char* portrait, const float* s
     char* js = avatarforcing_session_stats_json(s);
     if (verbose) printf("open: %s\n", js ? js : "(null)");
     CHECK(json_int(js, "next_frame") == 0 && json_int(js, "queue_frames") == 30, "stats after open: %s", js);
+    CHECK(json_int(js, "reanchors") == 0 && json_int(js, "last_reanchor_frame") == -1 &&
+              json_int(js, "reanchor_every") == 112 && json_int(js, "reanchor_max_defer") == 162 &&
+              json_int(js, "reanchor_fade_frames") == 25 && strstr(js, "\"reanchor_fade\":\"latent\""),
+          "reanchor stats after open: %s", js);
     avatarforcing_free_string(js);
 
     /* Not for a live session. */
@@ -312,6 +317,8 @@ static int run_call(avatarforcing_ctx* ctx, const char* portrait, const float* s
     if (verbose) printf("end: %s\n", js ? js : "(null)");
     CHECK(json_int(js, "blocks") == 15 && json_int(js, "speech_blocks") == 7 && json_int(js, "queued_frames") == 0,
           "stats at the end: %s", js);
+    /* 15 blocks: no reanchor with the default policy (the first is at block 112). */
+    CHECK(json_int(js, "reanchors") == 0 && json_int(js, "blocks_since_reanchor") == 15, "reanchors at the end: %s", js);
     avatarforcing_free_string(js);
     avatarforcing_session_close(s);
     return have;
@@ -369,6 +376,16 @@ int main(void) {
           "live_* without live: %s", avatarforcing_last_error(ctx));
     CHECK(avatarforcing_session_open(ctx, portrait, "{\"live\": true, \"live_queue_blocks\": 0}") == NULL,
           "live_queue_blocks 0 opens");
+    CHECK(avatarforcing_session_open(ctx, portrait, "{\"live_reanchor_every\": 5}") == NULL &&
+              strstr(avatarforcing_last_error(ctx), "live"),
+          "live_reanchor_every without live: %s", avatarforcing_last_error(ctx));
+    CHECK(avatarforcing_session_open(ctx, portrait, "{\"live\": true, \"live_reanchor_max_defer\": -1}") == NULL,
+          "live_reanchor_max_defer -1 opens");
+    CHECK(avatarforcing_session_open(ctx, portrait, "{\"live\": true, \"live_reanchor_hold\": 1}") == NULL,
+          "live_reanchor_hold takes a number");
+    CHECK(avatarforcing_session_open(ctx, portrait, "{\"live\": true, \"live_reanchor_fade\": \"blend\"}") == NULL &&
+              strstr(avatarforcing_last_error(ctx), "latent"),
+          "live_reanchor_fade blend: %s", avatarforcing_last_error(ctx));
     uint8_t* none = NULL;
     CHECK(avatarforcing_generate_frames_pcm(ctx, portrait, speech, sr, sr, "{\"live\": true}", &none, NULL, NULL, NULL,
                                             NULL) == -1 &&
@@ -392,6 +409,7 @@ int main(void) {
         CHECK(avatarforcing_session_interrupt(plain, 0) == -1, "interrupt on a plain session");
         CHECK(avatarforcing_session_push_phrase(plain, speech, sr, sr, -1) == -1, "push_phrase on a plain session");
         CHECK(avatarforcing_session_stats_json(plain) == NULL, "stats on a plain session");
+        CHECK(avatarforcing_session_reanchor(plain) == -1, "reanchor on a plain session");
         avatarforcing_session_close(plain);
     }
 

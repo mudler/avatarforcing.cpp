@@ -36,6 +36,11 @@ avatarforcing-cli --model avatarforcing-f32.gguf --portrait portrait512.png \
 | `--profile` | off | per-op time profile of the decoder graphs (node by node, slow) |
 | `--realtime` | off | live mode: steps on the wall clock, one block every 400 ms, and counts the late blocks |
 | `--queue-blocks N` | 3 | live mode: blocks that may wait for the writer |
+| `--reanchor-every N` | GGUF (112) | live mode: steady blocks before a reanchor when idle; 0: none |
+| `--reanchor-max-defer N` | GGUF (162) | live mode: steady blocks before a reanchor also in speech; 0: none |
+| `--reanchor-fade M` | `latent` | live mode: fade after a reanchor: `latent` (motion), `pixel` (the live app's RGB cross-fade) or `none` |
+| `--reanchor-fade-frames N` | GGUF (25) | live mode: fade frames after a reanchor; 0: none |
+| `--reanchor-hold` | off | live mode: the reanchor block repeats the last frame, as the live app |
 
 Give `-o`, `--frames-dir` or both. At the end the tool prints the time of
 each stage, the sampler and decoder time of a steady block and the period
@@ -128,7 +133,8 @@ Upstream cuts the video to the audio length with `-shortest`.
 
 The live app runs the same model in a different loop. The offline mode of
 the CLI does not implement these. Live mode (`--live`, next section)
-implements all of them except the reanchor:
+implements all of them, with one change: it fades the reanchor in the
+motion space by default, not in RGB (see below):
 
 - wav2vec2 runs per TTS phrase on the raw PCM (`--audio-mode raw`): no
   normalization, zero padding, `max(1, ceil(samples / 640))` frames.
@@ -159,6 +165,20 @@ implements all of them except the reanchor:
   the face goes idle.
 - `end` ends the call. Without it, the call ends 2 s after the last event.
 
+The reanchor works as in the library (`docs/capi.md`, "Reanchor"): by
+default every 112 steady blocks when idle, at the latest after 162, with a
+25-frame fade of the motion. A short call does not reach it.
+`--reanchor-every N`, `--reanchor-max-defer N` and
+`--reanchor-fade-frames N` change the policy and the fade length (0 turns
+each off). `--reanchor-fade pixel` uses the RGB cross-fade of the live app
+instead, and `--reanchor-hold` repeats the last frame in the reanchor
+block, as the live app does. The tool prints each reanchor and its step
+time.
+
+Use `--nfe 6`, the default, for live mode. At nfe 10 a reanchor step takes
+391 ms of the 400 ms block on an NVIDIA Thor: a live caller must then keep
+two blocks of frames ahead of playback.
+
 Time 0 is frame 0, the first frame after the hidden primer. The tool steps
 one block (10 frames, 400 ms) at a time. Before each step it sends the
 events whose frame is in that block, as a caller that runs one block ahead
@@ -170,8 +190,8 @@ The mp4 has the frames of the whole call. Its audio track holds each phrase
 at its start frame, cut at the interrupts. wav2vec2 gets the raw PCM
 (`--audio-mode raw`) unless `--audio-mode` says otherwise. At the end the
 tool prints the time from the start of the session to the first frame,
-the step time per block, for idle blocks and for blocks with speech, and
-the session statistics. With `--realtime` it waits for the time
+the step time per block, for idle blocks, for blocks with speech and for
+reanchor blocks, the reanchor frames, and the session statistics. With `--realtime` it waits for the time
 of each block, as a live caller does, and counts the blocks that were not
 ready in time. The writer runs in the same loop, so the count includes the
 output time: `--frames-dir` writes PNG files at about 50 ms per frame and

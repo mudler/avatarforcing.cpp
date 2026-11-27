@@ -20,6 +20,24 @@ double ms_since(Clock::time_point t0) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Reanchor cross-fade
+
+void crossfade(const uint8_t* anchor, uint8_t* frame, size_t n, int remaining, int total) {
+    // numpy: alpha * anchor.astype(float32) + (1.0 - alpha) * frame.astype(float32)
+    // with a Python float alpha: both weights round to float32, each product
+    // and the sum are float32. volatile keeps the compiler from fusing them.
+    const double alpha = (double)remaining / (double)total;
+    const float a = (float)alpha, b = (float)(1.0 - alpha);
+    for (size_t i = 0; i < n; ++i) {
+        volatile float pa = a * (float)anchor[i];
+        volatile float pb = b * (float)frame[i];
+        float v = pa + pb;
+        v = std::min(255.0f, std::max(0.0f, v));
+        frame[i] = (uint8_t)(int)v;   // astype(uint8) truncates
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LiveSchedule
 
 void LiveSchedule::init(const std::vector<float>& idle, int idle_rows, int dim, int origin, int history) {
@@ -112,6 +130,10 @@ LiveSession::LiveSession(Engine& e, const GenOptions& go, const LiveOptions& lo,
     queue_cap_ = std::max(1, lo_.queue_blocks) * nb_;
     max_ahead_ = (int64_t)std::max(0, lo_.max_ahead_seconds) * e_.fps();
     frame_bytes_ = (size_t)e_.size() * e_.size() * 3;
+    policy_.every = lo_.reanchor_every < 0 ? (int)fc.reanchor_every : lo_.reanchor_every;
+    policy_.max_defer = lo_.reanchor_max_defer < 0 ? (int)fc.reanchor_max_defer : lo_.reanchor_max_defer;
+    fade_frames_ = lo_.reanchor_fade_frames < 0 ? (int)fc.reanchor_fade_frames : lo_.reanchor_fade_frames;
+    if (lo_.reanchor_fade == ReanchorFade::None) fade_frames_ = 0;
 }
 
 LiveSession::~LiveSession() {
@@ -150,12 +172,7 @@ bool LiveSession::open(const float* image, std::string& err) {
         std::lock_guard<std::mutex> slk(sched_mu_);
         sched_.init(audio.idle_features(), audio.idle_frames(), E_, clip_, clip_);
     }
-    auto sink = [this](const uint8_t* rgb, int n, std::string&) -> bool {
-        std::lock_guard<std::mutex> qlk(q_mu_);
-        for (int f = 0; f < n; ++f)
-            ready_.emplace_back(rgb + (size_t)f * frame_bytes_, rgb + (size_t)(f + 1) * frame_bytes_);
-        return true;
-    };
+    auto sink = [this](const uint8_t* rgb, int n, std::string&) -> bool { return this->sink(rgb, n); };
     gen_.reset(new Generator(e_, go_, sink, cancel_));
     if (!gen_->encode_portrait(image, err) || !gen_->init_sampler(err)) return false;
     // Hidden primer: clip frames of idle features (frames -clip .. -1),
@@ -167,6 +184,35 @@ bool LiveSession::open(const float* image, std::string& err) {
         sched_.commit(0);
     }
     return gen_->primer_hidden(wa_.data(), err);
+}
+
+// The frames of one block, in order. rgb nullptr: a held block, n copies of
+// the last frame. A cross-fade that starts at a frame takes the frame before
+// it as its anchor and blends the next fade_frames_ frames.
+bool LiveSession::sink(const uint8_t* rgb, int n) {
+    std::lock_guard<std::mutex> qlk(q_mu_);
+    for (int f = 0; f < n; ++f) {
+        const uint8_t* prev = f > 0 ? ready_.back().data() : (last_.empty() ? nullptr : last_.data());
+        std::vector<uint8_t> fr;
+        if (rgb) fr.assign(rgb + (size_t)f * frame_bytes_, rgb + (size_t)(f + 1) * frame_bytes_);
+        else if (prev) fr.assign(prev, prev + frame_bytes_);
+        else fr.assign(frame_bytes_, 0);
+        while (!fades_.empty() && fades_.front() <= out_frame_) {
+            if (fades_.front() == out_frame_ && prev) {
+                anchor_.assign(prev, prev + frame_bytes_);
+                fade_left_ = fade_frames_;
+            }
+            fades_.pop_front();
+        }
+        if (fade_left_ > 0) {
+            crossfade(anchor_.data(), fr.data(), frame_bytes_, fade_left_, fade_frames_);
+            if (--fade_left_ == 0) anchor_.clear();
+        }
+        ready_.push_back(std::move(fr));
+        ++out_frame_;
+    }
+    if (n > 0) last_ = ready_.back();
+    return true;
 }
 
 int64_t LiveSession::push_phrase(const float* pcm, size_t n, int64_t at, uint64_t epoch, std::string& err,
@@ -219,35 +265,69 @@ int64_t LiveSession::step(std::string& err) {
         }
     }
     const auto t0 = Clock::now();
-    // The block reads ctx frames of context (already computed) and nb new
-    // frames. A reanchor (milestone M2) goes here: on its policy, a primer on
-    // the last clip frames of features, sched_.window(t - clip_, clip_), in
-    // place of this block.
+    // A steady block reads ctx frames of context (already computed) and nb
+    // new frames. A reanchor block (ReanchorPolicy) is a primer on the clip
+    // frames that end with the block, as in the live app.
     int64_t t = 0;
     int speech = 0;
-    wa_.resize((size_t)(ctx_ + nb_) * E_);
+    bool reanchor = false, hold = false;
     {
         std::lock_guard<std::mutex> slk(sched_mu_);
         t = sched_.next();
-        sched_.window(t - ctx_, ctx_ + nb_, wa_.data());
-        sched_.window(t, nb_, wa_.data() + (size_t)ctx_ * E_, &speech);   // the new frames, to count speech
+        reanchor = policy_.due(sched_.speech_end() <= t, reanchor_req_.load());
+        if (reanchor) {
+            reanchor_req_ = false;
+            // The live app holds the last frame; before any frame, emit.
+            hold = lo_.reanchor_hold && blocks_ > 0;
+            wa_.resize((size_t)(clip_ + nb_) * E_);
+            sched_.window(t + nb_ - clip_, clip_, wa_.data());
+            sched_.window(t, nb_, wa_.data() + (size_t)clip_ * E_, &speech);   // to count speech
+        } else {
+            wa_.resize((size_t)(ctx_ + nb_) * E_);
+            sched_.window(t - ctx_, ctx_ + nb_, wa_.data());
+            sched_.window(t, nb_, wa_.data() + (size_t)ctx_ * E_, &speech);   // the new frames, to count speech
+        }
         sched_.commit(t + nb_);
     }
     {
         std::lock_guard<std::mutex> qlk(q_mu_);
         produced_ += nb_;
+        // The fade starts with the first frame that comes from the new caches.
+        if (reanchor && fade_frames_ > 0 && lo_.reanchor_fade == ReanchorFade::Pixel)
+            fades_.push_back(hold ? t + nb_ : t);
     }
-    if (!gen_->steady_block(wa_.data(), err)) {
+    const int latent_fade = lo_.reanchor_fade == ReanchorFade::Latent ? fade_frames_ : 0;
+    const bool ok = reanchor ? gen_->reanchor_block(wa_.data(), !hold, latent_fade, err)
+                             : gen_->steady_block(wa_.data(), err);
+    if (!ok) {
         set_failed(err);
         return -1;
     }
     const double ms = ms_since(t0);
     std::lock_guard<std::mutex> slk(sched_mu_);
+    policy_.done(reanchor);
     ++blocks_;
     if (speech > 0) ++speech_blocks_;
     last_step_ms_ = ms;
     max_step_ms_ = std::max(max_step_ms_, ms);
+    if (reanchor) {
+        ++reanchors_;
+        last_reanchor_ = t;
+        last_reanchor_ms_ = ms;
+        max_reanchor_ms_ = std::max(max_reanchor_ms_, ms);
+    }
     return t;
+}
+
+int64_t LiveSession::request_reanchor() {
+    std::lock_guard<std::mutex> slk(sched_mu_);
+    reanchor_req_ = true;
+    return sched_.next();
+}
+
+int64_t LiveSession::last_reanchor_frame() const {
+    std::lock_guard<std::mutex> slk(sched_mu_);
+    return last_reanchor_;
 }
 
 int64_t LiveSession::interrupt(int64_t at) {
@@ -288,16 +368,22 @@ std::string LiveSession::stats_json() {
         ready = (int)ready_.size();
     }
     std::lock_guard<std::mutex> slk(sched_mu_);
-    char buf[640];
+    char buf[1024];
     std::snprintf(buf, sizeof(buf),
                   "{\"next_frame\":%lld,\"speech_end\":%lld,\"pending_phrases\":%d,\"queued_frames\":%lld,"
                   "\"ready_frames\":%d,\"queue_frames\":%d,\"blocks\":%lld,\"speech_blocks\":%lld,"
                   "\"queue_full\":%lld,\"phrases\":%lld,\"dropped_phrases\":%lld,\"interrupts\":%lld,"
-                  "\"last_step_ms\":%.1f,\"max_step_ms\":%.1f}",
+                  "\"last_step_ms\":%.1f,\"max_step_ms\":%.1f,\"reanchors\":%lld,\"last_reanchor_frame\":%lld,"
+                  "\"blocks_since_reanchor\":%d,\"reanchor_every\":%d,\"reanchor_max_defer\":%d,"
+                  "\"reanchor_fade_frames\":%d,\"reanchor_fade\":\"%s\",\"last_reanchor_ms\":%.1f,"
+                  "\"max_reanchor_ms\":%.1f}",
                   (long long)sched_.next(), (long long)sched_.speech_end(), sched_.pending_phrases(),
                   (long long)queued, ready, queue_cap_, (long long)blocks_, (long long)speech_blocks_,
                   (long long)queue_full_, (long long)phrases_, (long long)dropped_, (long long)interrupts_,
-                  last_step_ms_, max_step_ms_);
+                  last_step_ms_, max_step_ms_, (long long)reanchors_, (long long)last_reanchor_, policy_.since,
+                  policy_.every, policy_.max_defer, fade_frames_,
+                  fade_frames_ == 0 ? "none" : lo_.reanchor_fade == ReanchorFade::Pixel ? "pixel" : "latent",
+                  last_reanchor_ms_, max_reanchor_ms_);
     return buf;
 }
 
